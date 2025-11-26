@@ -1,0 +1,778 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/widget"
+)
+
+const (
+	Version             = "0.1.1"   // flexclient GUI version
+	serverPort          = 14992     // UDP port on each flextool server
+	netbirdDefaultCLI   = "netbird" // overridden by NETBIRD_CLI env
+	helloInterval       = 30        // seconds between HELLOs
+	broadcastPort       = 4992      // FlexRadio discovery port on LAN
+	heartbeatListUpdate = 1 * time.Second
+	discoveryActiveFor  = 10 * time.Second // RX "active" window
+
+	// GitHub repo for updates (your repo)
+	githubOwner = "KingSteve032"
+	githubRepo  = "Flex-Radio-Network-Tool"
+	// asset name to download from releases (must match your uploaded .exe)
+	updateAssetName = "flexclient-gui.exe"
+)
+
+type flextoolRoute struct {
+	ID string
+	IP net.IP
+}
+
+type routeStatus struct {
+	lastHeartbeat time.Time
+	lastDiscovery time.Time
+}
+
+var (
+	routesMu sync.RWMutex
+	routes   []flextoolRoute
+
+	statusMu       sync.RWMutex
+	routeStatusMap = make(map[string]*routeStatus)
+
+	clientMu      sync.Mutex
+	clientCancel  context.CancelFunc
+	clientRunning bool
+)
+
+// --- logging setup ---
+
+func setupLogging() {
+	exePath, err := os.Executable()
+	if err != nil {
+		log.Printf("os.Executable error: %v", err)
+		return
+	}
+	dir := filepath.Dir(exePath)
+	logPath := filepath.Join(dir, "flexclient-gui.log")
+
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("failed to open log file %s: %v", logPath, err)
+		return
+	}
+
+	log.SetOutput(f)
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	log.Printf("===== flexclient GUI v%s started =====", Version)
+	log.Printf("Executable: %s", exePath)
+
+	logGPUInfo()
+}
+
+// Log GPU info on Windows using PowerShell / Win32_VideoController
+func logGPUInfo() {
+	if runtime.GOOS != "windows" {
+		log.Printf("GPU info: non-Windows OS (%s), skipping GPU query", runtime.GOOS)
+		return
+	}
+
+	cmd := exec.Command("powershell", "-NoProfile", "-Command",
+		`Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name`)
+
+	out, err := cmd.Output()
+	if err != nil {
+		log.Printf("GPU info: failed to query via PowerShell: %v", err)
+		return
+	}
+
+	lines := strings.Split(string(out), "\n")
+	var gpus []string
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l != "" {
+			gpus = append(gpus, l)
+		}
+	}
+
+	if len(gpus) == 0 {
+		log.Printf("GPU info: no adapters found")
+		return
+	}
+
+	for i, g := range gpus {
+		log.Printf("GPU[%d]: %s", i, g)
+	}
+}
+
+// --- NetBird route discovery ---
+
+func netbirdCLIPath() string {
+	if p := os.Getenv("NETBIRD_CLI"); p != "" {
+		return p
+	}
+	return netbirdDefaultCLI
+}
+
+func discoverFlextoolRoutes() ([]flextoolRoute, error) {
+	cmdPath := netbirdCLIPath()
+	log.Printf("Running NetBird CLI: %s routes list", cmdPath)
+
+	cmd := exec.Command(cmdPath, "routes", "list")
+	out, err := cmd.Output()
+	if err != nil {
+		log.Printf("Error running 'netbird routes list': %v", err)
+		return nil, fmt.Errorf("failed to run 'netbird routes list': %w", err)
+	}
+
+	var routes []flextoolRoute
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+
+	var currentID string
+	var isFlextool bool
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		// "ID: KC4CAW Flextool"
+		if strings.Contains(line, "ID:") {
+			idx := strings.Index(line, "ID:")
+			if idx >= 0 {
+				currentID = strings.TrimSpace(line[idx+len("ID:"):])
+				isFlextool = strings.Contains(strings.ToLower(currentID), "flextool")
+			}
+			continue
+		}
+
+		// "Network: 10.10.2.5/32"
+		if isFlextool && strings.Contains(line, "Network:") {
+			idx := strings.Index(line, "Network:")
+			if idx < 0 {
+				continue
+			}
+			netStr := strings.TrimSpace(line[idx+len("Network:"):])
+			parts := strings.SplitN(netStr, "/", 2)
+			if len(parts) == 0 {
+				continue
+			}
+			ipStr := strings.TrimSpace(parts[0])
+			ip := net.ParseIP(ipStr)
+			if ip == nil {
+				log.Printf("Failed to parse IP from NetBird route: %q", ipStr)
+				continue
+			}
+
+			routes = append(routes, flextoolRoute{
+				ID: currentID,
+				IP: ip,
+			})
+
+			log.Printf("Discovered flextool route: ID=%q IP=%s", currentID, ip.String())
+
+			// done with this ID
+			isFlextool = false
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		log.Printf("Scanner error parsing 'netbird routes list': %v", err)
+		return nil, fmt.Errorf("scanner error parsing 'netbird routes list': %w", err)
+	}
+
+	log.Printf("Total flextool routes discovered: %d", len(routes))
+	return routes, nil
+}
+
+// --- Status helpers ---
+
+func initRouteStatusFor(routes []flextoolRoute) {
+	statusMu.Lock()
+	defer statusMu.Unlock()
+	routeStatusMap = make(map[string]*routeStatus)
+	for _, r := range routes {
+		routeStatusMap[r.ID] = &routeStatus{}
+	}
+	log.Printf("Initialized route status map for %d routes", len(routes))
+}
+
+func markHeartbeat(routeID string) {
+	statusMu.Lock()
+	defer statusMu.Unlock()
+	s, ok := routeStatusMap[routeID]
+	if !ok {
+		s = &routeStatus{}
+		routeStatusMap[routeID] = s
+	}
+	s.lastHeartbeat = time.Now()
+}
+
+func markDiscovery(routeID string) {
+	statusMu.Lock()
+	defer statusMu.Unlock()
+	s, ok := routeStatusMap[routeID]
+	if !ok {
+		s = &routeStatus{}
+		routeStatusMap[routeID] = s
+	}
+	s.lastDiscovery = time.Now()
+}
+
+func getRouteStatus(routeID string) (heartbeatAgo, discoveryAgo time.Duration, hasHB, hasRX bool) {
+	statusMu.RLock()
+	defer statusMu.RUnlock()
+	s, ok := routeStatusMap[routeID]
+	if !ok {
+		return 0, 0, false, false
+	}
+	if !s.lastHeartbeat.IsZero() {
+		heartbeatAgo = time.Since(s.lastHeartbeat)
+		hasHB = true
+	}
+	if !s.lastDiscovery.IsZero() {
+		discoveryAgo = time.Since(s.lastDiscovery)
+		hasRX = true
+	}
+	return
+}
+
+// --- Rebroadcast ---
+
+func rebroadcastDiscoveryPacket(payload []byte) {
+	dest := &net.UDPAddr{
+		IP:   net.IPv4bcast, // 255.255.255.255
+		Port: broadcastPort,
+	}
+
+	conn, err := net.DialUDP("udp", nil, dest)
+	if err != nil {
+		log.Printf("rebroadcast: DialUDP error: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write(payload); err != nil {
+		log.Printf("rebroadcast: Write error: %v", err)
+	}
+}
+
+// One goroutine per Flextool server
+func runForServer(ctx context.Context, route flextoolRoute) {
+	serverAddr := &net.UDPAddr{
+		IP:   route.IP,
+		Port: serverPort,
+	}
+
+	conn, err := net.DialUDP("udp", nil, serverAddr)
+	if err != nil {
+		log.Printf("[%s] DialUDP to server %s failed: %v", route.ID, serverAddr.String(), err)
+		return
+	}
+	defer conn.Close()
+
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	clientIP := localAddr.IP.String()
+	log.Printf("[%s] Connected to server %s from local %s (client_ip=%s)", route.ID, serverAddr.String(), localAddr.String(), clientIP)
+
+	helloPayload := []byte(fmt.Sprintf(
+		"HELLO client_ip=%s client_version=%s",
+		clientIP, Version,
+	))
+
+	// Send initial HELLO
+	if _, err := conn.Write(helloPayload); err != nil {
+		log.Printf("[%s] Initial HELLO send failed: %v", route.ID, err)
+	}
+
+	// Keepalive HELLOs
+	go func() {
+		ticker := time.NewTicker(time.Duration(helloInterval) * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				log.Printf("[%s] HELLO ticker stopping (context cancelled)", route.ID)
+				return
+			case <-ticker.C:
+				if _, err := conn.Write(helloPayload); err != nil {
+					log.Printf("[%s] HELLO send failed: %v", route.ID, err)
+					return
+				}
+			}
+		}
+	}()
+
+	// Receive loop
+	buf := make([]byte, 4096)
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("[%s] Receive loop stopping (context cancelled)", route.ID)
+			return
+		default:
+		}
+
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+
+		n, _, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			log.Printf("[%s] ReadFromUDP error: %v", route.ID, err)
+			time.Sleep(time.Second)
+			continue
+		}
+
+		payload := buf[:n]
+
+		// HEARTBEAT detection
+		if bytes.HasPrefix(payload, []byte("HEARTBEAT")) {
+			markHeartbeat(route.ID)
+			continue
+		}
+
+		// Discovery packet
+		markDiscovery(route.ID)
+		rebroadcastDiscoveryPacket(payload)
+	}
+}
+
+// --- Orchestration: discover routes & start goroutines ---
+
+func startFlexClient(ctx context.Context) {
+	log.Printf("startFlexClient: begin")
+	routesFound, err := discoverFlextoolRoutes()
+	if err != nil {
+		log.Printf("startFlexClient: discoverFlextoolRoutes error: %v", err)
+		return
+	}
+	if len(routesFound) == 0 {
+		log.Printf("startFlexClient: no Flextool routes found, nothing to do")
+		return
+	}
+
+	initRouteStatusFor(routesFound)
+
+	routesMu.Lock()
+	routes = routesFound
+	routesMu.Unlock()
+
+	for _, r := range routesFound {
+		route := r
+		log.Printf("startFlexClient: launching server handler for route %s (%s)", route.ID, route.IP.String())
+		go runForServer(ctx, route)
+	}
+
+	// Block until stopped, then clear state
+	<-ctx.Done()
+	log.Printf("startFlexClient: context cancelled, clearing state")
+
+	routesMu.Lock()
+	routes = nil
+	routesMu.Unlock()
+
+	statusMu.Lock()
+	routeStatusMap = make(map[string]*routeStatus)
+	statusMu.Unlock()
+}
+
+// --- Version compare & auto-update ---
+
+type ghRelease struct {
+	TagName string `json:"tag_name"`
+	Assets  []struct {
+		Name               string `json:"name"`
+		BrowserDownloadURL string `json:"browser_download_url"`
+	} `json:"assets"`
+}
+
+func fetchLatestRelease() (*ghRelease, error) {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", githubOwner, githubRepo)
+	log.Printf("Checking for updates at %s", url)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	// GitHub wants a User-Agent
+	req.Header.Set("User-Agent", "flexclient-gui/"+Version)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("http error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("GitHub API status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var rel ghRelease
+	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+		return nil, fmt.Errorf("decode error: %w", err)
+	}
+	log.Printf("GitHub latest release tag: %s", rel.TagName)
+	return &rel, nil
+}
+
+func normalizeVersion(v string) string {
+	v = strings.TrimSpace(v)
+	v = strings.TrimPrefix(v, "v")
+	return v
+}
+
+func parseSemver(v string) (major, minor, patch int) {
+	v = normalizeVersion(v)
+	parts := strings.Split(v, ".")
+	if len(parts) > 0 {
+		fmt.Sscanf(parts[0], "%d", &major)
+	}
+	if len(parts) > 1 {
+		fmt.Sscanf(parts[1], "%d", &minor)
+	}
+	if len(parts) > 2 {
+		fmt.Sscanf(parts[2], "%d", &patch)
+	}
+	return
+}
+
+func isNewerVersion(current, latest string) bool {
+	cMaj, cMin, cPatch := parseSemver(current)
+	lMaj, lMin, lPatch := parseSemver(latest)
+
+	if lMaj > cMaj {
+		return true
+	}
+	if lMaj < cMaj {
+		return false
+	}
+	if lMin > cMin {
+		return true
+	}
+	if lMin < cMin {
+		return false
+	}
+	return lPatch > cPatch
+}
+
+func findUpdateAsset(rel *ghRelease) (string, bool) {
+	for _, a := range rel.Assets {
+		if a.Name == updateAssetName {
+			return a.BrowserDownloadURL, true
+		}
+	}
+	return "", false
+}
+
+func downloadFile(url, path string) error {
+	log.Printf("Downloading update from %s to %s", url, path)
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	_, err = io.Copy(f, resp.Body)
+	return err
+}
+
+func runWindowsUpdateBatch(currentExe, newExe string) error {
+	dir := filepath.Dir(currentExe)
+	exeName := filepath.Base(currentExe)
+
+	batPath := filepath.Join(dir, "flexclient_update.bat")
+
+	// Use ping to wait ~2 seconds for this process to exit, then replace and restart.
+	contents := fmt.Sprintf(`@echo off
+echo Updating FlexClient...
+ping 127.0.0.1 -n 3 >nul
+copy /y "%s" "%s" >nul
+start "" "%s"
+del "%s"
+del "%%~f0"
+`, newExe, currentExe, exeName, newExe)
+
+	if err := os.WriteFile(batPath, []byte(contents), 0644); err != nil {
+		return err
+	}
+
+	log.Printf("Starting update batch: %s", batPath)
+	cmd := exec.Command("cmd", "/C", batPath)
+	return cmd.Start()
+}
+
+// --- Fyne GUI ---
+
+func main() {
+	// set up log file first
+	setupLogging()
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC: %v", r)
+		}
+		log.Printf("===== flexclient GUI exiting =====")
+	}()
+
+	log.Printf("Initializing Fyne app")
+	a := app.New()
+	w := a.NewWindow("FlexClient GUI")
+	w.Resize(fyne.NewSize(650, 420))
+	log.Printf("Window created")
+
+	// Route list
+	routeList := widget.NewList(
+		func() int {
+			routesMu.RLock()
+			defer routesMu.RUnlock()
+			return len(routes)
+		},
+		func() fyne.CanvasObject {
+			return widget.NewLabel("")
+		},
+		func(i widget.ListItemID, o fyne.CanvasObject) {
+			label := o.(*widget.Label)
+
+			routesMu.RLock()
+			defer routesMu.RUnlock()
+			if i < 0 || i >= len(routes) {
+				label.SetText("")
+				return
+			}
+			r := routes[i]
+
+			hbAgo, rxAgo, hasHB, hasRX := getRouteStatus(r.ID)
+
+			hbText := "HB: none"
+			if hasHB {
+				hbText = fmt.Sprintf("HB: %s ago", hbAgo.Round(time.Second))
+			}
+
+			rxText := "RX: idle"
+			if hasRX && rxAgo < discoveryActiveFor {
+				rxText = "RX: active"
+			} else if hasRX {
+				rxText = fmt.Sprintf("RX: idle (%s ago)", rxAgo.Round(time.Second))
+			}
+
+			label.SetText(fmt.Sprintf("%s (%s) – %s – %s", r.ID, r.IP.String(), hbText, rxText))
+		},
+	)
+
+	// Periodic refresh of routeList (for heartbeat/discovery age)
+	go func() {
+		log.Printf("Starting routeList refresh ticker")
+		ticker := time.NewTicker(heartbeatListUpdate)
+		defer ticker.Stop()
+		for range ticker.C {
+			fyne.Do(func() {
+				routeList.Refresh()
+			})
+		}
+	}()
+
+	// Start / Stop buttons
+	startBtn := widget.NewButton("Start", nil)
+	stopBtn := widget.NewButton("Stop", nil)
+	stopBtn.Disable()
+
+	// Version label & Update button
+	versionLabel := widget.NewLabel("Version: " + Version)
+	updateBtn := widget.NewButton("Check for Updates", nil)
+
+	startBtn.OnTapped = func() {
+		log.Printf("Start button clicked")
+		clientMu.Lock()
+		defer clientMu.Unlock()
+
+		if clientRunning {
+			log.Printf("Client already running, ignoring Start")
+			return
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		clientCancel = cancel
+		clientRunning = true
+
+		startBtn.Disable()
+		stopBtn.Enable()
+
+		go startFlexClient(ctx)
+	}
+
+	stopBtn.OnTapped = func() {
+		log.Printf("Stop button clicked")
+		clientMu.Lock()
+		defer clientMu.Unlock()
+
+		if !clientRunning {
+			log.Printf("Client not running, ignoring Stop")
+			return
+		}
+
+		clientCancel()
+		clientCancel = nil
+		clientRunning = false
+
+		startBtn.Enable()
+		stopBtn.Disable()
+	}
+
+	updateBtn.OnTapped = func() {
+		log.Printf("Check for Updates button clicked")
+
+		// No updates on non-Windows for now
+		if runtime.GOOS != "windows" {
+			dialog.ShowInformation("Updates", "Auto-update is only implemented for Windows binaries.", w)
+			return
+		}
+
+		// Run in background so we don't block UI
+		go func() {
+			fyne.Do(func() {
+				updateBtn.Disable()
+				updateBtn.SetText("Checking…")
+			})
+
+			rel, err := fetchLatestRelease()
+			if err != nil {
+				log.Printf("Update check failed: %v", err)
+				fyne.Do(func() {
+					updateBtn.SetText("Check for Updates")
+					updateBtn.Enable()
+					dialog.ShowError(err, w)
+				})
+				return
+			}
+
+			latestTag := normalizeVersion(rel.TagName)
+			currentTag := normalizeVersion(Version)
+
+			if !isNewerVersion(currentTag, latestTag) {
+				log.Printf("No update available. Current=%s Latest=%s", currentTag, latestTag)
+				fyne.Do(func() {
+					updateBtn.SetText("Check for Updates")
+					updateBtn.Enable()
+					dialog.ShowInformation("Updates", fmt.Sprintf("You are up to date.\nCurrent: %s\nLatest: %s", currentTag, latestTag), w)
+				})
+				return
+			}
+
+			log.Printf("New version available: current=%s latest=%s", currentTag, latestTag)
+
+			downloadURL, ok := findUpdateAsset(rel)
+			if !ok {
+				log.Printf("No asset named %s in latest release", updateAssetName)
+				fyne.Do(func() {
+					updateBtn.SetText("Check for Updates")
+					updateBtn.Enable()
+					dialog.ShowInformation("Updates", fmt.Sprintf("New version %s is available, but no %s asset was found.", latestTag, updateAssetName), w)
+				})
+				return
+			}
+
+			// Ask user to confirm
+			fyne.Do(func() {
+				dialog.ShowConfirm(
+					"Update Available",
+					fmt.Sprintf("A new version is available.\nCurrent: %s\nLatest: %s\n\nDownload and install now?", currentTag, latestTag),
+					func(ok bool) {
+						if !ok {
+							log.Printf("User declined update")
+							updateBtn.SetText("Check for Updates")
+							updateBtn.Enable()
+							return
+						}
+
+						// Actually download in another goroutine
+						go func() {
+							fyne.Do(func() {
+								updateBtn.SetText("Downloading…")
+								updateBtn.Disable()
+							})
+
+							exePath, err := os.Executable()
+							if err != nil {
+								log.Printf("os.Executable failed during update: %v", err)
+								fyne.Do(func() {
+									updateBtn.SetText("Check for Updates")
+									updateBtn.Enable()
+									dialog.ShowError(fmt.Errorf("cannot locate current executable: %w", err), w)
+								})
+								return
+							}
+
+							dir := filepath.Dir(exePath)
+							newExe := filepath.Join(dir, "flexclient-gui.new.exe")
+
+							if err := downloadFile(downloadURL, newExe); err != nil {
+								log.Printf("Download failed: %v", err)
+								fyne.Do(func() {
+									updateBtn.SetText("Check for Updates")
+									updateBtn.Enable()
+									dialog.ShowError(fmt.Errorf("download failed: %w", err), w)
+								})
+								return
+							}
+
+							if err := runWindowsUpdateBatch(exePath, newExe); err != nil {
+								log.Printf("Starting updater batch failed: %v", err)
+								fyne.Do(func() {
+									updateBtn.SetText("Check for Updates")
+									updateBtn.Enable()
+									dialog.ShowError(fmt.Errorf("failed to start updater: %w", err), w)
+								})
+								return
+							}
+
+							log.Printf("Update batch started, exiting process")
+							// Exit this app so the batch can replace the EXE
+							os.Exit(0)
+						}()
+					},
+					w,
+				)
+			})
+		}()
+	}
+
+	// Layout: buttons + version/info + list
+	topBar := container.NewHBox(startBtn, stopBtn, widget.NewSeparator(), versionLabel, updateBtn)
+	content := container.NewBorder(topBar, nil, nil, nil, routeList)
+	w.SetContent(content)
+	log.Printf("Window content set, entering ShowAndRun")
+
+	w.ShowAndRun()
+}
