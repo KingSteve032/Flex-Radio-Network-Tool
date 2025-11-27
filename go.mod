@@ -1,4 +1,4 @@
-module github.com/littleairmada/flexclient
+module github.com/KingSteve032/Flex-Radio-Network-Tool
 
 go 1.20
 

@@ -1,6 +1,7 @@
 package frnt
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -26,7 +28,7 @@ import (
 
 const (
 	AppName             = "Flex Radio Network Tool"
-	Version             = "0.1.0" // bump as needed
+	Version             = "0.1.2" // bump as needed
 	heartbeatListUpdate = 1 * time.Second
 	discoveryActiveFor  = 10 * time.Second // RX "active" window
 
@@ -35,6 +37,9 @@ const (
 	githubRepo  = "Flex-Radio-Network-Tool"
 	// asset name to download from releases (must match uploaded Windows exe)
 	updateAssetName = "flexclient-gui.exe"
+
+	// fallback SmartSDR version (used only if winget detection fails)
+	SmartSDRVersionFallback = "Unknown"
 )
 
 // --- logging setup ---
@@ -71,6 +76,7 @@ func logGPUInfo() {
 
 	cmd := exec.Command("powershell", "-NoProfile", "-Command",
 		`Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name`)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 
 	out, err := cmd.Output()
 	if err != nil {
@@ -95,6 +101,84 @@ func logGPUInfo() {
 	for i, g := range gpus {
 		log.Printf("GPU[%d]: %s", i, g)
 	}
+}
+
+// --- NetBird + SmartSDR version helpers for About page ---
+
+func netbirdCLIPath() string {
+	if p := os.Getenv("NETBIRD_CLI"); p != "" {
+		return p
+	}
+	return "netbird"
+}
+
+// getNetbirdVersions runs "netbird status" and parses Daemon/CLI versions.
+func getNetbirdVersions() (daemonVer, cliVer string, err error) {
+	cmdPath := netbirdCLIPath()
+	cmd := exec.Command(cmdPath, "status")
+	if runtime.GOOS == "windows" {
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	}
+
+	out, err := cmd.CombinedOutput()
+	output := string(out)
+	if err != nil {
+		return "", "", fmt.Errorf("netbird status error: %w (output: %s)", err, output)
+	}
+
+	scanner := bufio.NewScanner(strings.NewReader(output))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "Daemon version:") {
+			daemonVer = strings.TrimSpace(strings.TrimPrefix(line, "Daemon version:"))
+		} else if strings.HasPrefix(line, "CLI version:") {
+			cliVer = strings.TrimSpace(strings.TrimPrefix(line, "CLI version:"))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return daemonVer, cliVer, fmt.Errorf("scanner error: %w", err)
+	}
+
+	return daemonVer, cliVer, nil
+}
+
+// getSmartSDRVersion runs "winget list" and tries to find the SmartSDR entry.
+func getSmartSDRVersion() (string, error) {
+	if runtime.GOOS != "windows" {
+		return "", fmt.Errorf("SmartSDR detection only implemented on Windows")
+	}
+
+	cmd := exec.Command("winget", "list")
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("winget list error: %w (output: %s)", err, string(out))
+	}
+
+	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		// Look for any entry containing "SmartSDR"
+		if strings.Contains(line, "SmartSDR") {
+			// Example line:
+			// FlexRadio Systems SmartSDR v4.0.1        ARP\Machine\X64\{fb40460f-...} 4.0.1
+			// We want the *last* field (4.0.1)
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				ver := fields[len(fields)-1]
+				return ver, nil
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("scanner error: %w", err)
+	}
+
+	return "", fmt.Errorf("SmartSDR not found in winget list output")
 }
 
 // --- update logic ---
@@ -228,6 +312,7 @@ del "%%~f0"
 
 	log.Printf("Updates: starting update batch %s", batPath)
 	cmd := exec.Command("cmd", "/C", batPath)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	return cmd.Start()
 }
 
@@ -245,10 +330,18 @@ func Run() {
 	log.Printf("GUI: initializing Fyne app")
 	a := app.New()
 	w := a.NewWindow(AppName)
-	w.Resize(fyne.NewSize(650, 420))
+	w.Resize(fyne.NewSize(800, 450))
 	log.Printf("GUI: window created")
 
-	// Route list
+	// ---------- Shared state for flexclient start/stop ----------
+	var (
+		clientMu      sync.Mutex
+		clientCancel  context.CancelFunc
+		clientRunning bool
+	)
+
+	// ---------- Flexclient page: route list + Start/Stop ----------
+
 	routeList := widget.NewList(
 		func() int {
 			rs := flexclient.Routes()
@@ -284,7 +377,7 @@ func Run() {
 		},
 	)
 
-	// Periodic refresh of routeList for heartbeat/discovery age
+	// Periodic refresh of routeList
 	go func() {
 		log.Printf("GUI: starting routeList refresh ticker")
 		ticker := time.NewTicker(heartbeatListUpdate)
@@ -296,23 +389,39 @@ func Run() {
 		}
 	}()
 
-	// Start / Stop buttons
 	startBtn := widget.NewButton("Start", nil)
 	stopBtn := widget.NewButton("Stop", nil)
 	stopBtn.Disable()
 
-	// Version label & Update button
-	versionLabel := widget.NewLabel(AppName + " Version: " + Version)
-	updateBtn := widget.NewButton("Check for Updates", nil)
-
-	var (
-		clientMu      sync.Mutex
-		clientCancel  context.CancelFunc
-		clientRunning bool
-	)
-
+	// Start behavior
 	startBtn.OnTapped = func() {
 		log.Printf("GUI: Start clicked")
+
+		// Check NetBird status before starting flexclient
+		connected, needsLogin, raw, err := flexclient.CheckNetbirdStatus()
+		if err != nil {
+			log.Printf("GUI: NetBird status check failed: %v, output:\n%s", err, raw)
+			dialog.ShowInformation(
+				"NetBird status",
+				"Could not check NetBird status. Please make sure NetBird is installed and running, then try again.",
+				w,
+			)
+			return
+		}
+		if !connected {
+			if needsLogin {
+				log.Printf("GUI: NetBird requires login (NeedsLogin)")
+			} else {
+				log.Printf("GUI: NetBird not connected to management")
+			}
+			dialog.ShowInformation(
+				"NetBird not connected",
+				"Please log into netbird then try again.",
+				w,
+			)
+			return
+		}
+
 		clientMu.Lock()
 		defer clientMu.Unlock()
 
@@ -331,6 +440,7 @@ func Run() {
 		go flexclient.Start(ctx, Version)
 	}
 
+	// Stop behavior
 	stopBtn.OnTapped = func() {
 		log.Printf("GUI: Stop clicked")
 		clientMu.Lock()
@@ -349,6 +459,107 @@ func Run() {
 		stopBtn.Disable()
 	}
 
+	// Flexclient page layout (right side "Flexclient" view)
+	flexclientTopBar := container.NewHBox(startBtn, stopBtn)
+	flexclientPage := container.NewBorder(flexclientTopBar, nil, nil, nil, routeList)
+
+	// ---------- About page (right side "About" view) ----------
+
+	appVersionLabel := widget.NewLabel(AppName + " Version: " + Version)
+	latestVersionLabel := widget.NewLabel("Latest available: checking…")
+	updateBtn := widget.NewButton("Check for Updates", nil)
+
+	netbirdVersionLabel := widget.NewLabel("NetBird: detecting…")
+	smartSDRLabel := widget.NewLabel("SmartSDR Version: detecting…")
+
+	aboutText := widget.NewLabel(
+		"Flex Radio Network Tool\n\n" +
+			"Internal engine: flexclient\n\n" +
+			"This tool discovers FlexRadio broadcasts across NetBird VPN\n" +
+			"and rebroadcasts them on your local network so SmartSDR\n" +
+			"and other clients can see your radios as if they were local.",
+	)
+
+	aboutHeader := widget.NewLabelWithStyle("About", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+
+	aboutPage := container.NewVBox(
+		aboutHeader,
+		appVersionLabel,
+		latestVersionLabel,
+		updateBtn,
+		netbirdVersionLabel,
+		smartSDRLabel,
+		widget.NewSeparator(),
+		aboutText,
+	)
+
+	// Resolve NetBird version in background
+	go func() {
+		daemonVer, cliVer, err := getNetbirdVersions()
+		var text string
+		if err != nil {
+			log.Printf("About: failed to get NetBird version: %v", err)
+			text = "NetBird: not detected"
+		} else if daemonVer == "" && cliVer == "" {
+			text = "NetBird: version unknown"
+		} else if daemonVer != "" && cliVer != "" {
+			text = fmt.Sprintf("NetBird: Daemon %s, CLI %s", daemonVer, cliVer)
+		} else if daemonVer != "" {
+			text = fmt.Sprintf("NetBird: Daemon %s", daemonVer)
+		} else {
+			text = fmt.Sprintf("NetBird: CLI %s", cliVer)
+		}
+
+		fyne.Do(func() {
+			netbirdVersionLabel.SetText(text)
+		})
+	}()
+
+	// Resolve SmartSDR version in background via winget
+	go func() {
+		ver, err := getSmartSDRVersion()
+		var text string
+		if err != nil {
+			log.Printf("About: failed to get SmartSDR version: %v", err)
+			text = "SmartSDR Version: " + SmartSDRVersionFallback
+		} else {
+			text = "SmartSDR Version: " + ver
+		}
+		fyne.Do(func() {
+			smartSDRLabel.SetText(text)
+		})
+	}()
+
+	// Auto-check for updates on startup (background)
+	go func() {
+		rel, err := fetchLatestRelease()
+		if err != nil {
+			log.Printf("Updates: initial check failed: %v", err)
+			fyne.Do(func() {
+				latestVersionLabel.SetText("Latest available: unknown")
+			})
+			return
+		}
+
+		latestTag := normalizeVersion(rel.TagName)
+		currentTag := normalizeVersion(Version)
+		newer := isNewerVersion(currentTag, latestTag)
+
+		fyne.Do(func() {
+			latestVersionLabel.SetText("Latest available: " + latestTag)
+			if newer {
+				updateBtn.SetText("Update Available")
+				dialog.ShowInformation(
+					"Update Available",
+					fmt.Sprintf("A new version is available.\nCurrent: %s\nLatest: %s\n\nOpen About and click \"Update Available\" to install.",
+						currentTag, latestTag),
+					w,
+				)
+			}
+		})
+	}()
+
+	// Update behavior (About page)
 	updateBtn.OnTapped = func() {
 		log.Printf("GUI: Check for Updates clicked")
 
@@ -382,6 +593,7 @@ func Run() {
 				fyne.Do(func() {
 					updateBtn.SetText("Check for Updates")
 					updateBtn.Enable()
+					latestVersionLabel.SetText("Latest available: " + latestTag)
 					dialog.ShowInformation("Updates",
 						fmt.Sprintf("You are up to date.\nCurrent: %s\nLatest: %s", currentTag, latestTag), w)
 				})
@@ -396,6 +608,7 @@ func Run() {
 				fyne.Do(func() {
 					updateBtn.SetText("Check for Updates")
 					updateBtn.Enable()
+					latestVersionLabel.SetText("Latest available: " + latestTag)
 					dialog.ShowInformation("Updates",
 						fmt.Sprintf("New version %s is available, but no %s asset was found.", latestTag, updateAssetName), w)
 				})
@@ -412,6 +625,7 @@ func Run() {
 							log.Printf("Updates: user declined update")
 							updateBtn.SetText("Check for Updates")
 							updateBtn.Enable()
+							latestVersionLabel.SetText("Latest available: " + latestTag)
 							return
 						}
 
@@ -465,10 +679,47 @@ func Run() {
 		}()
 	}
 
-	topBar := container.NewHBox(startBtn, stopBtn, widget.NewSeparator(), versionLabel, updateBtn)
-	content := container.NewBorder(topBar, nil, nil, nil, routeList)
-	w.SetContent(content)
-	log.Printf("GUI: content set, entering ShowAndRun")
+	// ---------- Left menu + content switching ----------
+
+	menuItems := []string{"Flexclient", "About"}
+
+	contentStack := container.NewMax(flexclientPage) // default view
+
+	menu := widget.NewList(
+		func() int {
+			return len(menuItems)
+		},
+		func() fyne.CanvasObject {
+			return widget.NewLabel("")
+		},
+		func(i widget.ListItemID, o fyne.CanvasObject) {
+			label := o.(*widget.Label)
+			label.SetText(menuItems[i])
+		},
+	)
+
+	menu.OnSelected = func(id widget.ListItemID) {
+		if id < 0 || int(id) >= len(menuItems) {
+			return
+		}
+		switch menuItems[id] {
+		case "Flexclient":
+			contentStack.Objects = []fyne.CanvasObject{flexclientPage}
+		case "About":
+			contentStack.Objects = []fyne.CanvasObject{aboutPage}
+		}
+		contentStack.Refresh()
+	}
+
+	// select Flexclient by default
+	menu.Select(0)
+
+	// Two-pane layout: left menu, right content
+	split := container.NewHSplit(menu, contentStack)
+	split.Offset = 0.2 // 20% left, 80% right
+
+	w.SetContent(split)
+	log.Printf("GUI: content set (left menu + right pages), entering ShowAndRun")
 
 	w.ShowAndRun()
 }

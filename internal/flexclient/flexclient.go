@@ -9,8 +9,10 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -39,7 +41,43 @@ var (
 	routeStatusMap = make(map[string]*routeStatus)
 )
 
-// --- public API ---
+// CheckNetbirdStatus runs `netbird status` and returns whether we are connected
+// to management, whether it explicitly needs login, the raw output, and any error.
+func CheckNetbirdStatus() (connected bool, needsLogin bool, raw string, err error) {
+	cmdPath := netbirdCLIPath()
+	cmd := exec.Command(cmdPath, "status")
+	if runtime.GOOS == "windows" {
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	}
+
+	out, err := cmd.CombinedOutput()
+	raw = string(out)
+
+	if err != nil {
+		log.Printf("flexclient: netbird status error: %v, output:\n%s", err, raw)
+		return false, false, raw, err
+	}
+
+	// Example 1: "Daemon status: NeedsLogin"
+	if strings.Contains(raw, "Daemon status: NeedsLogin") {
+		log.Printf("flexclient: netbird status -> NeedsLogin")
+		return false, true, raw, nil
+	}
+
+	// Example 2/3: look for Management line
+	if strings.Contains(raw, "Management: Connected") {
+		log.Printf("flexclient: netbird status -> Management: Connected")
+		return true, false, raw, nil
+	}
+
+	if strings.Contains(raw, "Management: Disconnected") {
+		log.Printf("flexclient: netbird status -> Management: Disconnected")
+	}
+
+	// Default: treat anything else as "not connected"
+	log.Printf("flexclient: netbird status -> not connected, output:\n%s", raw)
+	return false, false, raw, nil
+}
 
 // Start runs the flexclient engine until ctx is cancelled.
 // version is included in HELLO messages.
@@ -125,6 +163,9 @@ func discoverFlextoolRoutes() ([]Route, error) {
 	log.Printf("flexclient: running NetBird CLI: %s routes list", cmdPath)
 
 	cmd := exec.Command(cmdPath, "routes", "list")
+	if runtime.GOOS == "windows" {
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	}
 	out, err := cmd.Output()
 	if err != nil {
 		log.Printf("flexclient: error running 'netbird routes list': %v", err)
