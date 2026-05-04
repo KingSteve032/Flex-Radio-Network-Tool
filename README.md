@@ -108,6 +108,8 @@ Workflow file: `.github/workflows/release.yml`
 What it does:
 - Builds binaries on native runners for:
   - Linux `amd64`
+  - Linux `arm64`
+  - Linux `armv7` (Raspberry Pi 3/4 32-bit OS)
   - Windows `amd64`
   - macOS `amd64` and `arm64`
 - Uploads artifacts for every run.
@@ -120,3 +122,24 @@ How to publish:
    - `git tag v0.2.0`
    - `git push origin v0.2.0`
 4. GitHub Actions builds and publishes release assets automatically.
+
+## Server Update From GitHub Release
+
+Use script: `scripts/update-server-from-release.sh`
+
+Examples:
+
+```bash
+# latest release
+bash scripts/update-server-from-release.sh
+
+# specific tag
+bash scripts/update-server-from-release.sh v0.2.0
+```
+
+The script auto-detects architecture and installs:
+- `frnt-linux-amd64`
+- `frnt-linux-arm64`
+- `frnt-linux-armv7`
+
+Then it restarts `frnt-listen.service`.
