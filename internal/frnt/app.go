@@ -26,13 +26,13 @@ import (
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/widget"
 
+	"github.com/KingSteve032/Flex-Radio-Network-Tool/internal/buildinfo"
 	"github.com/KingSteve032/Flex-Radio-Network-Tool/internal/flexclient"
 	"github.com/KingSteve032/Flex-Radio-Network-Tool/internal/procutil"
 )
 
 const (
 	AppName              = "Flex Radio Network Tool"
-	Version              = "0.1.2" // bump as needed
 	heartbeatListUpdate  = 1 * time.Second
 	discoveryActiveFor   = 10 * time.Second // RX "active" window
 	netbirdStatusTimeout = 5 * time.Second
@@ -60,7 +60,7 @@ func setupLogging() {
 
 	log.SetOutput(f)
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Printf("===== %s v%s started =====", AppName, Version)
+	log.Printf("===== %s v%s started =====", AppName, buildinfo.Short())
 	log.Printf("Executable: %s", exePath)
 
 	logGPUInfo()
@@ -434,7 +434,7 @@ func Run() {
 
 			ctx, cancel := context.WithCancel(context.Background())
 			startupResult := make(chan error, 1)
-			go flexclient.Start(ctx, Version, startupResult)
+			go flexclient.Start(ctx, buildinfo.Short(), startupResult)
 
 			startErr := <-startupResult
 			if startErr != nil {
@@ -590,7 +590,7 @@ func Run() {
 	)
 
 	// ---------- About page ----------
-	appVersionLabel := widget.NewLabel(AppName + " Version: " + Version)
+	appVersionLabel := widget.NewLabel(AppName + " Version: " + buildinfo.Full())
 
 	netbirdVersionLabel := widget.NewLabel("NetBird: detecting...")
 	smartSDRLabel := widget.NewLabel("SmartSDR Version: detecting...")

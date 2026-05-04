@@ -88,3 +88,35 @@ MULTI_PROXY=true
 - Linux defaults to `server` mode when `--mode` is omitted.
 - Windows and macOS default to `client` mode when `--mode` is omitted.
 - `server` mode uses `libpcap` (required for `listen`/`pcap`) and SQLite (`sync` db storage).
+
+## Versioning
+
+- Single source of truth: `internal/buildinfo/buildinfo.go`
+- Runtime check:
+  - `frnt --version`
+  - `frnt --mode server version`
+
+For CI/release builds, version metadata is injected via `-ldflags`:
+- `Version` (tag like `v0.2.0`)
+- `Commit` (short SHA)
+- `BuildDate` (UTC timestamp)
+
+## GitHub Releases
+
+Workflow file: `.github/workflows/release.yml`
+
+What it does:
+- Builds binaries on native runners for:
+  - Linux `amd64`
+  - Windows `amd64`
+  - macOS `amd64` and `arm64`
+- Uploads artifacts for every run.
+- On tag push `v*`, creates a GitHub Release and attaches the binaries.
+
+How to publish:
+1. Update `internal/buildinfo/buildinfo.go` (if needed for local default version).
+2. Commit to `main`.
+3. Tag and push:
+   - `git tag v0.2.0`
+   - `git push origin v0.2.0`
+4. GitHub Actions builds and publishes release assets automatically.

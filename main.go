@@ -6,11 +6,20 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/KingSteve032/Flex-Radio-Network-Tool/internal/buildinfo"
 	flexservercmd "github.com/KingSteve032/Flex-Radio-Network-Tool/internal/flexserver/cmd"
 	"github.com/KingSteve032/Flex-Radio-Network-Tool/internal/frnt"
 )
 
 func main() {
+	if len(os.Args) == 2 {
+		switch strings.TrimSpace(os.Args[1]) {
+		case "--version", "-v", "version":
+			fmt.Println(buildinfo.Full())
+			return
+		}
+	}
+
 	mode, remainingArgs, err := parseModeArgs(os.Args[1:])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "argument error:", err)
@@ -83,6 +92,7 @@ func defaultMode() string {
 
 func printUsage(out *os.File) {
 	fmt.Fprintln(out, "Usage:")
+	fmt.Fprintln(out, "  Flex-Radio-Network-Tool --version")
 	fmt.Fprintln(out, "  Flex-Radio-Network-Tool --mode client")
 	fmt.Fprintln(out, "  Flex-Radio-Network-Tool --mode server <subcommand> [flags]")
 	fmt.Fprintln(out, "")

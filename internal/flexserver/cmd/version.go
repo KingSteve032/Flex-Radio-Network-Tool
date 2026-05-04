@@ -7,6 +7,7 @@ package cmd
 import (
 	"fmt"
 
+	"github.com/KingSteve032/Flex-Radio-Network-Tool/internal/buildinfo"
 	"github.com/spf13/cobra"
 )
 
@@ -15,7 +16,7 @@ var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Displays the flextool version",
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("0.0.3")
+		fmt.Println(buildinfo.Full())
 	},
 }
 
