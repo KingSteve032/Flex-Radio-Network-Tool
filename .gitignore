@@ -1,3 +1,13 @@
 # Output
 dist/
 *.exe
+
+# Local build/test caches (workspace-scoped for sandboxed runs)
+.gocache/
+.gomodcache/
+
+# Runtime log output
+flexclient-gui.log
+
+# Local runtime settings
+flexclient-settings.json

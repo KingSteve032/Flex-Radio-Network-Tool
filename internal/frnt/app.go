@@ -1,42 +1,41 @@
+//go:build windows || darwin
+
 package frnt
 
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
+	"image/color"
 	"log"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
-	"syscall"
+	"sync/atomic"
 	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/KingSteve032/Flex-Radio-Network-Tool/internal/flexclient"
+	"github.com/KingSteve032/Flex-Radio-Network-Tool/internal/procutil"
 )
 
 const (
-	AppName             = "Flex Radio Network Tool"
-	Version             = "0.1.2" // bump as needed
-	heartbeatListUpdate = 1 * time.Second
-	discoveryActiveFor  = 10 * time.Second // RX "active" window
-
-	// GitHub repo for updates (your repo)
-	githubOwner = "KingSteve032"
-	githubRepo  = "Flex-Radio-Network-Tool"
-	// asset name to download from releases (must match uploaded Windows exe)
-	updateAssetName = "flexclient-gui.exe"
+	AppName              = "Flex Radio Network Tool"
+	Version              = "0.1.2" // bump as needed
+	heartbeatListUpdate  = 1 * time.Second
+	discoveryActiveFor   = 10 * time.Second // RX "active" window
+	netbirdStatusTimeout = 5 * time.Second
 
 	// fallback SmartSDR version (used only if winget detection fails)
 	SmartSDRVersionFallback = "Unknown"
@@ -76,7 +75,7 @@ func logGPUInfo() {
 
 	cmd := exec.Command("powershell", "-NoProfile", "-Command",
 		`Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name`)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	procutil.HideWindow(cmd)
 
 	out, err := cmd.Output()
 	if err != nil {
@@ -116,9 +115,7 @@ func netbirdCLIPath() string {
 func getNetbirdVersions() (daemonVer, cliVer string, err error) {
 	cmdPath := netbirdCLIPath()
 	cmd := exec.Command(cmdPath, "status")
-	if runtime.GOOS == "windows" {
-		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	}
+	procutil.HideWindow(cmd)
 
 	out, err := cmd.CombinedOutput()
 	output := string(out)
@@ -143,15 +140,22 @@ func getNetbirdVersions() (daemonVer, cliVer string, err error) {
 }
 
 // getSmartSDRVersion runs "winget list" and tries to find the SmartSDR entry.
+// Uses a timeout so it can't hang the app.
 func getSmartSDRVersion() (string, error) {
 	if runtime.GOOS != "windows" {
 		return "", fmt.Errorf("SmartSDR detection only implemented on Windows")
 	}
 
-	cmd := exec.Command("winget", "list")
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "winget", "list")
+	procutil.HideWindow(cmd)
 
 	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return "", fmt.Errorf("winget list timed out")
+	}
 	if err != nil {
 		return "", fmt.Errorf("winget list error: %w (output: %s)", err, string(out))
 	}
@@ -162,11 +166,7 @@ func getSmartSDRVersion() (string, error) {
 		if line == "" {
 			continue
 		}
-		// Look for any entry containing "SmartSDR"
 		if strings.Contains(line, "SmartSDR") {
-			// Example line:
-			// FlexRadio Systems SmartSDR v4.0.1        ARP\Machine\X64\{fb40460f-...} 4.0.1
-			// We want the *last* field (4.0.1)
 			fields := strings.Fields(line)
 			if len(fields) >= 2 {
 				ver := fields[len(fields)-1]
@@ -179,141 +179,6 @@ func getSmartSDRVersion() (string, error) {
 	}
 
 	return "", fmt.Errorf("SmartSDR not found in winget list output")
-}
-
-// --- update logic ---
-
-type ghRelease struct {
-	TagName string `json:"tag_name"`
-	Assets  []struct {
-		Name               string `json:"name"`
-		BrowserDownloadURL string `json:"browser_download_url"`
-	} `json:"assets"`
-}
-
-func fetchLatestRelease() (*ghRelease, error) {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", githubOwner, githubRepo)
-	log.Printf("Updates: checking %s", url)
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", AppName+" "+Version)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("http error: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("GitHub API status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var rel ghRelease
-	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
-		return nil, fmt.Errorf("decode error: %w", err)
-	}
-	log.Printf("Updates: latest tag %s", rel.TagName)
-	return &rel, nil
-}
-
-func normalizeVersion(v string) string {
-	v = strings.TrimSpace(v)
-	v = strings.TrimPrefix(v, "v")
-	return v
-}
-
-func parseSemver(v string) (major, minor, patch int) {
-	v = normalizeVersion(v)
-	parts := strings.Split(v, ".")
-	if len(parts) > 0 {
-		fmt.Sscanf(parts[0], "%d", &major)
-	}
-	if len(parts) > 1 {
-		fmt.Sscanf(parts[1], "%d", &minor)
-	}
-	if len(parts) > 2 {
-		fmt.Sscanf(parts[2], "%d", &patch)
-	}
-	return
-}
-
-func isNewerVersion(current, latest string) bool {
-	cMaj, cMin, cPatch := parseSemver(current)
-	lMaj, lMin, lPatch := parseSemver(latest)
-
-	if lMaj > cMaj {
-		return true
-	}
-	if lMaj < cMaj {
-		return false
-	}
-	if lMin > cMin {
-		return true
-	}
-	if lMin < cMin {
-		return false
-	}
-	return lPatch > cPatch
-}
-
-func findUpdateAsset(rel *ghRelease) (string, bool) {
-	for _, a := range rel.Assets {
-		if a.Name == updateAssetName {
-			return a.BrowserDownloadURL, true
-		}
-	}
-	return "", false
-}
-
-func downloadFile(url, path string) error {
-	log.Printf("Updates: downloading from %s to %s", url, path)
-	resp, err := http.Get(url)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
-	}
-
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	_, err = io.Copy(f, resp.Body)
-	return err
-}
-
-func runWindowsUpdateBatch(currentExe, newExe string) error {
-	dir := filepath.Dir(currentExe)
-	exeName := filepath.Base(currentExe)
-	batPath := filepath.Join(dir, "flexclient_update.bat")
-
-	contents := fmt.Sprintf(`@echo off
-echo Updating %s...
-ping 127.0.0.1 -n 3 >nul
-copy /y "%s" "%s" >nul
-start "" "%s"
-del "%s"
-del "%%~f0"
-`, AppName, newExe, currentExe, exeName, newExe)
-
-	if err := os.WriteFile(batPath, []byte(contents), 0644); err != nil {
-		return err
-	}
-
-	log.Printf("Updates: starting update batch %s", batPath)
-	cmd := exec.Command("cmd", "/C", batPath)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	return cmd.Start()
 }
 
 // --- GUI entrypoint ---
@@ -335,37 +200,73 @@ func Run() {
 
 	// ---------- Shared state for flexclient start/stop ----------
 	var (
-		clientMu      sync.Mutex
-		clientCancel  context.CancelFunc
-		clientRunning bool
+		clientMu       sync.Mutex
+		clientCancel   context.CancelFunc
+		clientStarting bool
+		clientRunning  bool
 	)
+	var firewallCheckGeneration uint64
+	adminUnlocked := false
+	var aboutSelectTapCount int
+	var aboutSelectLastTap time.Time
+	menuItems := []string{"Flexclient", "Settings", "Help", "About"}
+	var menu *widget.List
+	var refreshMenuItems func()
 
-	// ---------- Flexclient page: route list + Start/Stop ----------
-
-	routeList := widget.NewList(
-		func() int {
-			rs := flexclient.Routes()
-			return len(rs)
-		},
-		func() fyne.CanvasObject {
-			return widget.NewLabel("")
-		},
-		func(i widget.ListItemID, o fyne.CanvasObject) {
-			label := o.(*widget.Label)
-			rs := flexclient.Routes()
-			if i < 0 || i >= len(rs) {
-				label.SetText("")
-				return
+	// Load saved proxy/direct settings if present.
+	if persisted, err := loadProxySettingsFromDisk(); err == nil {
+		flexclient.SetRadioModeSettings(persisted.ProxyBasePort, persisted.RadioModes)
+		ignoredRoutes := map[string]bool{}
+		for _, routeID := range persisted.IgnoredRoutes {
+			routeID = strings.TrimSpace(routeID)
+			if routeID == "" {
+				continue
 			}
-			r := rs[i]
+			ignoredRoutes[routeID] = true
+		}
+		flexclient.SetIgnoredRoutes(ignoredRoutes)
+		log.Printf("GUI: loaded proxy settings from %s", clientSettingsPath())
+	} else {
+		log.Printf("GUI: proxy settings file not loaded (%v), using env/defaults", err)
+	}
+
+	persistRuntimeSettings := func() error {
+		basePort, modes := flexclient.GetRadioModeSettings()
+		ignoredMap := flexclient.GetIgnoredRoutes()
+		ignoredRoutes := make([]string, 0, len(ignoredMap))
+		for routeID, ignored := range ignoredMap {
+			if ignored {
+				ignoredRoutes = append(ignoredRoutes, routeID)
+			}
+		}
+		return saveProxySettingsToDisk(proxySettingsFile{
+			ProxyBasePort: basePort,
+			RadioModes:    modes,
+			IgnoredRoutes: ignoredRoutes,
+		})
+	}
+
+	// ---------- Flexclient page: expandable route cards + Start/Stop ----------
+	routeExpanded := map[string]bool{}
+	routeCards := container.NewVBox()
+	routeCardsScroll := container.NewVScroll(routeCards)
+
+	var rebuildRouteCards func()
+	rebuildRouteCards = func() {
+		rs := flexclient.Routes()
+		rows := make([]fyne.CanvasObject, 0, len(rs))
+
+		for _, route := range rs {
+			r := route
+			if _, ok := routeExpanded[r.ID]; !ok {
+				routeExpanded[r.ID] = false
+			}
 
 			hbAgo, rxAgo, hasHB, hasRX := flexclient.GetRouteStatus(r.ID)
-
 			hbText := "HB: none"
 			if hasHB {
 				hbText = fmt.Sprintf("HB: %s ago", hbAgo.Round(time.Second))
 			}
-
 			rxText := "RX: idle"
 			if hasRX && rxAgo < discoveryActiveFor {
 				rxText = "RX: active"
@@ -373,18 +274,95 @@ func Run() {
 				rxText = fmt.Sprintf("RX: idle (%s ago)", rxAgo.Round(time.Second))
 			}
 
-			label.SetText(fmt.Sprintf("%s (%s) – %s – %s", r.ID, r.IP.String(), hbText, rxText))
-		},
-	)
+			title := widget.NewLabel(fmt.Sprintf("%s (%s) - %s - %s", r.ID, r.IP.String(), hbText, rxText))
 
-	// Periodic refresh of routeList
+			toggleText := "Show Radios"
+			if routeExpanded[r.ID] {
+				toggleText = "Hide Radios"
+			}
+			routeID := r.ID
+			toggleBtn := widget.NewButton(toggleText, func() {
+				routeExpanded[routeID] = !routeExpanded[routeID]
+				rebuildRouteCards()
+			})
+
+			ignoreRouteCheck := widget.NewCheck("Ignore FlexTool", nil)
+			ignoreRouteCheck.SetChecked(flexclient.IsRouteIgnored(r.ID))
+			ignoreRouteCheck.OnChanged = func(checked bool) {
+				flexclient.SetRouteIgnored(routeID, checked)
+				if err := persistRuntimeSettings(); err != nil {
+					log.Printf("GUI: failed to persist route ignore change for %s: %v", routeID, err)
+					return
+				}
+				log.Printf("GUI: set route %s ignored=%v", routeID, checked)
+			}
+
+			headerRow := container.NewHBox(toggleBtn, title, layout.NewSpacer(), ignoreRouteCheck)
+			cardBody := []fyne.CanvasObject{headerRow}
+
+			if routeExpanded[r.ID] {
+				radios := flexclient.GetRouteRadioStatuses(r.ID)
+				if len(radios) == 0 {
+					cardBody = append(cardBody, widget.NewLabel("No radios seen yet."))
+				} else {
+					for _, radio := range radios {
+						radioState := "idle"
+						age := time.Since(radio.LastSeen).Round(time.Second)
+						if time.Since(radio.LastSeen) < discoveryActiveFor {
+							radioState = "active"
+						}
+
+						radioLabel := widget.NewLabel(
+							fmt.Sprintf("Radio %s - %s (%s ago, packets=%d)", radio.Serial, radioState, age, radio.PacketSeen),
+						)
+
+						modeRadio := widget.NewRadioGroup([]string{"direct", "proxy", "off"}, nil)
+						modeRadio.Horizontal = true
+						modeRadio.SetSelected(flexclient.GetRadioMode(radio.Serial))
+
+						serial := radio.Serial
+						modeRadio.OnChanged = func(mode string) {
+							if mode == "" {
+								return
+							}
+							flexclient.SetRadioModeForSerial(serial, mode)
+							if err := persistRuntimeSettings(); err != nil {
+								log.Printf("GUI: failed to persist per-radio mode change for %s: %v", serial, err)
+								return
+							}
+							log.Printf("GUI: set radio %s mode=%s", serial, mode)
+						}
+
+						radioRow := container.NewHBox(
+							layout.NewSpacer(),
+							radioLabel,
+							layout.NewSpacer(),
+							widget.NewLabel("Mode"),
+							modeRadio,
+						)
+						cardBody = append(cardBody, radioRow)
+					}
+				}
+			}
+
+			card := widget.NewCard("", "", container.NewVBox(cardBody...))
+			rows = append(rows, card)
+		}
+
+		routeCards.Objects = rows
+		routeCards.Refresh()
+	}
+
+	rebuildRouteCards()
+
+	// Periodic refresh of route cards.
 	go func() {
-		log.Printf("GUI: starting routeList refresh ticker")
+		log.Printf("GUI: starting route card refresh ticker")
 		ticker := time.NewTicker(heartbeatListUpdate)
 		defer ticker.Stop()
 		for range ticker.C {
 			fyne.Do(func() {
-				routeList.Refresh()
+				rebuildRouteCards()
 			})
 		}
 	}()
@@ -393,84 +371,233 @@ func Run() {
 	stopBtn := widget.NewButton("Stop", nil)
 	stopBtn.Disable()
 
-	// Start behavior
-	startBtn.OnTapped = func() {
-		log.Printf("GUI: Start clicked")
-
-		// Check NetBird status before starting flexclient
-		connected, needsLogin, raw, err := flexclient.CheckNetbirdStatus()
-		if err != nil {
-			log.Printf("GUI: NetBird status check failed: %v, output:\n%s", err, raw)
-			dialog.ShowInformation(
-				"NetBird status",
-				"Could not check NetBird status. Please make sure NetBird is installed and running, then try again.",
-				w,
-			)
-			return
-		}
-		if !connected {
-			if needsLogin {
-				log.Printf("GUI: NetBird requires login (NeedsLogin)")
-			} else {
-				log.Printf("GUI: NetBird not connected to management")
-			}
-			dialog.ShowInformation(
-				"NetBird not connected",
-				"Please log into netbird then try again.",
-				w,
-			)
-			return
-		}
-
-		clientMu.Lock()
-		defer clientMu.Unlock()
-
-		if clientRunning {
-			log.Printf("GUI: client already running, ignoring Start")
-			return
-		}
-
-		ctx, cancel := context.WithCancel(context.Background())
-		clientCancel = cancel
-		clientRunning = true
-
-		startBtn.Disable()
-		stopBtn.Enable()
-
-		go flexclient.Start(ctx, Version)
-	}
-
-	// Stop behavior
-	stopBtn.OnTapped = func() {
-		log.Printf("GUI: Stop clicked")
-		clientMu.Lock()
-		defer clientMu.Unlock()
-
-		if !clientRunning {
-			log.Printf("GUI: client not running, ignoring Stop")
-			return
-		}
-
-		clientCancel()
-		clientCancel = nil
-		clientRunning = false
-
+	setStoppedUI := func() {
+		startBtn.SetText("Start")
 		startBtn.Enable()
 		stopBtn.Disable()
 	}
 
-	// Flexclient page layout (right side "Flexclient" view)
+	startBtn.OnTapped = func() {
+		log.Printf("GUI: Start clicked")
+
+		clientMu.Lock()
+		if clientRunning || clientStarting {
+			log.Printf("GUI: client already running/starting, ignoring Start")
+			clientMu.Unlock()
+			return
+		}
+		clientStarting = true
+		clientMu.Unlock()
+
+		startBtn.Disable()
+		startBtn.SetText("Starting...")
+		stopBtn.Disable()
+
+		go func() {
+			// Check NetBird status before starting flexclient.
+			connected, needsLogin, raw, err := flexclient.CheckNetbirdStatus(netbirdStatusTimeout)
+			if err != nil {
+				log.Printf("GUI: NetBird status check failed: %v, output:\n%s", err, raw)
+				fyne.Do(func() {
+					clientMu.Lock()
+					clientStarting = false
+					clientMu.Unlock()
+					setStoppedUI()
+					dialog.ShowInformation(
+						"NetBird status",
+						"Could not check NetBird status. Please make sure NetBird is installed, running, and connected, then try again.",
+						w,
+					)
+				})
+				return
+			}
+			if !connected {
+				if needsLogin {
+					log.Printf("GUI: NetBird requires login (NeedsLogin)")
+				} else {
+					log.Printf("GUI: NetBird not connected to management")
+				}
+
+				fyne.Do(func() {
+					clientMu.Lock()
+					clientStarting = false
+					clientMu.Unlock()
+					setStoppedUI()
+					dialog.ShowInformation(
+						"NetBird not connected",
+						"Please log into NetBird then try again.",
+						w,
+					)
+				})
+				return
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			startupResult := make(chan error, 1)
+			go flexclient.Start(ctx, Version, startupResult)
+
+			startErr := <-startupResult
+			if startErr != nil {
+				log.Printf("GUI: flexclient failed to start: %v", startErr)
+				cancel()
+
+				fyne.Do(func() {
+					clientMu.Lock()
+					clientCancel = nil
+					clientRunning = false
+					clientStarting = false
+					clientMu.Unlock()
+					setStoppedUI()
+					dialog.ShowInformation(
+						"Flexclient start failed",
+						fmt.Sprintf("Could not start flexclient:\n\n%v", startErr),
+						w,
+					)
+				})
+				return
+			}
+
+			fyne.Do(func() {
+				clientMu.Lock()
+				clientCancel = cancel
+				clientRunning = true
+				clientStarting = false
+				clientMu.Unlock()
+
+				startBtn.SetText("Start")
+				startBtn.Disable()
+				stopBtn.Enable()
+			})
+		}()
+	}
+
+	stopBtn.OnTapped = func() {
+		log.Printf("GUI: Stop clicked")
+		clientMu.Lock()
+		cancel := clientCancel
+		if !clientRunning {
+			log.Printf("GUI: client not running, ignoring Stop")
+			clientMu.Unlock()
+			return
+		}
+
+		clientCancel = nil
+		clientRunning = false
+		clientStarting = false
+		clientMu.Unlock()
+
+		if cancel != nil {
+			cancel()
+		}
+
+		setStoppedUI()
+	}
+
 	flexclientTopBar := container.NewHBox(startBtn, stopBtn)
-	flexclientPage := container.NewBorder(flexclientTopBar, nil, nil, nil, routeList)
+	flexclientPage := container.NewBorder(flexclientTopBar, nil, nil, nil, routeCardsScroll)
 
-	// ---------- About page (right side "About" view) ----------
+	// ---------- Settings page ----------
+	proxyBasePort, radioModes := flexclient.GetRadioModeSettings()
 
+	proxyBasePortEntry := widget.NewEntry()
+	proxyBasePortEntry.SetText(fmt.Sprintf("%d", proxyBasePort))
+	proxyBasePortEntry.SetPlaceHolder("30000")
+
+	radioModesEntry := widget.NewMultiLineEntry()
+	radioModesEntry.SetPlaceHolder("serial=proxy\nanother-serial=direct\nthird-serial=off")
+	radioModesEntry.SetMinRowsVisible(14)
+	radioModesEntry.SetText(formatRadioModesText(radioModes))
+
+	settingsStatus := widget.NewLabel("Edit settings and click Save + Apply.")
+
+	saveApplyBtn := widget.NewButton("Save + Apply", func() {
+		basePort, err := parseProxyBasePort(proxyBasePortEntry.Text)
+		if err != nil {
+			settingsStatus.SetText("Error: " + err.Error())
+			dialog.ShowError(err, w)
+			return
+		}
+
+		modes, err := parseRadioModesText(radioModesEntry.Text)
+		if err != nil {
+			settingsStatus.SetText("Error: " + err.Error())
+			dialog.ShowError(err, w)
+			return
+		}
+
+		flexclient.SetRadioModeSettings(basePort, modes)
+		if err := persistRuntimeSettings(); err != nil {
+			settingsStatus.SetText("Applied in memory, but save failed: " + err.Error())
+			dialog.ShowError(err, w)
+			return
+		}
+
+		settingsStatus.SetText("Saved and applied.")
+		log.Printf("GUI: proxy settings saved/applied (%d radios)", len(modes))
+	})
+
+	reloadBtn := widget.NewButton("Reload Saved", func() {
+		cfg, err := loadProxySettingsFromDisk()
+		if err != nil {
+			settingsStatus.SetText("Reload failed: " + err.Error())
+			dialog.ShowError(err, w)
+			return
+		}
+
+		flexclient.SetRadioModeSettings(cfg.ProxyBasePort, cfg.RadioModes)
+		ignoredRoutes := map[string]bool{}
+		for _, routeID := range cfg.IgnoredRoutes {
+			routeID = strings.TrimSpace(routeID)
+			if routeID == "" {
+				continue
+			}
+			ignoredRoutes[routeID] = true
+		}
+		flexclient.SetIgnoredRoutes(ignoredRoutes)
+		proxyBasePortEntry.SetText(fmt.Sprintf("%d", cfg.ProxyBasePort))
+		radioModesEntry.SetText(formatRadioModesText(cfg.RadioModes))
+		settingsStatus.SetText("Reloaded saved settings.")
+	})
+
+	readRuntimeBtn := widget.NewButton("Load Current Runtime", func() {
+		base, modes := flexclient.GetRadioModeSettings()
+		proxyBasePortEntry.SetText(fmt.Sprintf("%d", base))
+		radioModesEntry.SetText(formatRadioModesText(modes))
+		settingsStatus.SetText("Loaded current runtime settings.")
+	})
+
+	settingsForm := widget.NewForm(
+		widget.NewFormItem("Proxy Base Port", proxyBasePortEntry),
+	)
+
+	settingsHelp := widget.NewLabel(
+		"Per radio mode (one per line): serial=direct, serial=proxy, or serial=off.\n" +
+			"Modes are explicit only. Unlisted radios stay direct.",
+	)
+
+	settingsPage := container.NewBorder(
+		container.NewVBox(
+			settingsForm,
+			settingsHelp,
+			container.NewHBox(saveApplyBtn, reloadBtn, readRuntimeBtn),
+			settingsStatus,
+			widget.NewSeparator(),
+		),
+		nil,
+		nil,
+		nil,
+		radioModesEntry,
+	)
+
+	// ---------- About page ----------
 	appVersionLabel := widget.NewLabel(AppName + " Version: " + Version)
-	latestVersionLabel := widget.NewLabel("Latest available: checking…")
-	updateBtn := widget.NewButton("Check for Updates", nil)
 
-	netbirdVersionLabel := widget.NewLabel("NetBird: detecting…")
-	smartSDRLabel := widget.NewLabel("SmartSDR Version: detecting…")
+	netbirdVersionLabel := widget.NewLabel("NetBird: detecting...")
+	smartSDRLabel := widget.NewLabel("SmartSDR Version: detecting...")
+
+	firewallLabel := widget.NewLabel("Firewall: checking...")
+	firewallFixBtn := widget.NewButton("Fix Firewall Rule", nil)
+	firewallFixBtn.Disable()
 
 	aboutText := widget.NewLabel(
 		"Flex Radio Network Tool\n\n" +
@@ -485,13 +612,398 @@ func Run() {
 	aboutPage := container.NewVBox(
 		aboutHeader,
 		appVersionLabel,
-		latestVersionLabel,
-		updateBtn,
 		netbirdVersionLabel,
 		smartSDRLabel,
+		firewallLabel,
+		firewallFixBtn,
 		widget.NewSeparator(),
 		aboutText,
 	)
+
+	// ---------- Help page ----------
+	helpHeader := widget.NewLabelWithStyle("Help", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	helpText := widget.NewLabel(
+		"What This Tool Does\n" +
+			"- Client mode discovers FRNT servers over NetBird and rebroadcasts Flex discovery locally for SmartSDR.\n" +
+			"- Server mode (Linux/headless) listens for radios on LAN and serves discovery/control/stream traffic to clients.\n\n" +
+			"Flexclient Page\n" +
+			"- Start: connects to Flextool routes and begins rebroadcasting discoveries.\n" +
+			"- Stop: disconnects all route workers.\n" +
+			"- Show Radios: expands a route card to list radios seen on that route.\n" +
+			"- Ignore FlexTool: hides all radios from that route from local discovery.\n\n" +
+			"Per-Radio Mode\n" +
+			"- direct: SmartSDR connects to the discovered radio endpoint directly.\n" +
+			"- proxy: discovery is rewritten so SmartSDR connects through the FRNT server.\n" +
+			"- off: this radio is ignored and not shown to SmartSDR.\n\n" +
+			"Settings Page\n" +
+			"- Proxy Base Port: base used for per-radio proxy listeners.\n" +
+			"- Radio Modes: optional serial=mode overrides (direct/proxy/off).\n" +
+			"- Save + Apply writes settings to flexclient-settings.json and applies immediately.\n\n" +
+			"Quick Troubleshooting\n" +
+			"- If Start fails, check NetBird login/management connectivity.\n" +
+			"- If radios are missing, verify route is not ignored and radio mode is not off.\n" +
+			"- If proxy fails, confirm server service is active and firewall rule is OK on About page.\n" +
+			"- Logs are written to flexclient-gui.log next to frnt.exe.",
+	)
+	helpText.Wrapping = fyne.TextWrapWord
+	helpPage := container.NewBorder(
+		container.NewVBox(helpHeader, widget.NewSeparator()),
+		nil,
+		nil,
+		nil,
+		container.NewVScroll(helpText),
+	)
+
+	// ---------- Hidden Admin page ----------
+	defaultListenInterface := strings.TrimSpace(os.Getenv("LISTEN_INTERFACE"))
+	if defaultListenInterface == "" {
+		defaultListenInterface = "ens18"
+	}
+	defaultSendInterface := strings.TrimSpace(os.Getenv("SEND_INTERFACE"))
+	if defaultSendInterface == "" {
+		defaultSendInterface = "ens18"
+	}
+	defaultAPIURL := strings.TrimSpace(os.Getenv("NETBIRD_API_URL"))
+	if defaultAPIURL == "" {
+		defaultAPIURL = "https://netbird.w4car.org/api/peers"
+	}
+
+	adminHeader := widget.NewLabelWithStyle("Admin (Hidden)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	adminHint := widget.NewLabel("Batch tools for Flextool servers. Use carefully.")
+	adminStatus := widget.NewLabel("Idle.")
+	adminStatus.Wrapping = fyne.TextWrapWord
+
+	adminServersEntry := widget.NewMultiLineEntry()
+	adminServersEntry.SetPlaceHolder("one per line:\nuser@10.2.0.164\nuser@10.10.1.50:22")
+	adminServersEntry.SetMinRowsVisible(7)
+
+	adminDefaultUser := widget.NewEntry()
+	adminDefaultUser.SetText("root")
+
+	adminSSHPassword := widget.NewPasswordEntry()
+	adminSSHPassword.SetPlaceHolder("SSH password (optional if keys are available)")
+
+	adminSudoPassword := widget.NewPasswordEntry()
+	adminSudoPassword.SetPlaceHolder("Sudo password (blank = same as SSH password)")
+
+	adminInstallCommand := widget.NewMultiLineEntry()
+	adminInstallCommand.SetPlaceHolder("Optional mass install/build command.\nExample:\ncd /home/testbed/frnt-smoke/src && go build -o /home/testbed/frnt-smoke/frnt .")
+	adminInstallCommand.SetMinRowsVisible(4)
+
+	adminServiceName := widget.NewEntry()
+	adminServiceName.SetText("frnt-listen.service")
+
+	adminBinaryPath := widget.NewEntry()
+	adminBinaryPath.SetText("/usr/local/bin/frnt")
+
+	adminRepoURL := widget.NewEntry()
+	adminRepoURL.SetText("https://github.com/KingSteve032/Flex-Radio-Network-Tool.git")
+
+	adminSourceDir := widget.NewEntry()
+	adminSourceDir.SetText("/opt/frnt/src")
+
+	adminBuildOutput := widget.NewEntry()
+	adminBuildOutput.SetText("/opt/frnt/frnt")
+
+	adminBroadcast := widget.NewCheck("", nil)
+	adminBroadcast.SetChecked(true)
+
+	adminListenIF := widget.NewEntry()
+	adminListenIF.SetText(defaultListenInterface)
+
+	adminSendIF := widget.NewEntry()
+	adminSendIF.SetText(defaultSendInterface)
+
+	adminDebug := widget.NewCheck("", nil)
+	adminDebug.SetChecked(false)
+
+	adminAPIToken := widget.NewPasswordEntry()
+	adminAPIToken.SetText(strings.TrimSpace(os.Getenv("NETBIRD_API_TOKEN")))
+
+	adminAPIURL := widget.NewEntry()
+	adminAPIURL.SetText(defaultAPIURL)
+
+	adminDiscoveryDelay := widget.NewEntry()
+	adminDiscoveryDelay.SetText("15")
+
+	adminSyncInterval := widget.NewEntry()
+	adminSyncInterval.SetText("60")
+
+	adminIgnoreRadios := widget.NewEntry()
+	adminIgnoreRadios.SetPlaceHolder("comma-separated IPs (optional)")
+
+	adminEnableVita := widget.NewCheck("", nil)
+	adminEnableVita.SetChecked(true)
+
+	adminVitaPort := widget.NewEntry()
+	adminVitaPort.SetText("4991")
+
+	adminProxyBasePort := widget.NewEntry()
+	adminProxyBasePort.SetText("30000")
+
+	adminMultiProxy := widget.NewCheck("", nil)
+	adminMultiProxy.SetChecked(true)
+
+	adminLog := widget.NewMultiLineEntry()
+	adminLog.SetMinRowsVisible(12)
+	adminLog.SetPlaceHolder("Batch output will appear here...")
+
+	appendAdminLog := func(line string) {
+		fyne.Do(func() {
+			ts := time.Now().Format("15:04:05")
+			if strings.TrimSpace(adminLog.Text) == "" {
+				adminLog.SetText("[" + ts + "] " + line)
+			} else {
+				adminLog.SetText(adminLog.Text + "\n[" + ts + "] " + line)
+			}
+		})
+	}
+
+	parsePositiveIntField := func(name, raw string) (int, error) {
+		v, err := strconv.Atoi(strings.TrimSpace(raw))
+		if err != nil || v < 0 {
+			return 0, fmt.Errorf("%s must be a non-negative integer", name)
+		}
+		return v, nil
+	}
+
+	runAdminAction := func(applyConfig, runInstall, installService, restartService bool, installCommandOverride string) {
+		targets, err := parseAdminTargets(adminServersEntry.Text, adminDefaultUser.Text)
+		if err != nil {
+			dialog.ShowError(err, w)
+			adminStatus.SetText("Input error: " + err.Error())
+			return
+		}
+
+		discoveryDelay, err := parsePositiveIntField("Discovery Delay", adminDiscoveryDelay.Text)
+		if err != nil {
+			dialog.ShowError(err, w)
+			adminStatus.SetText("Input error: " + err.Error())
+			return
+		}
+		syncInterval, err := parsePositiveIntField("Sync Interval", adminSyncInterval.Text)
+		if err != nil {
+			dialog.ShowError(err, w)
+			adminStatus.SetText("Input error: " + err.Error())
+			return
+		}
+		vitaPort, err := parsePositiveIntField("VITA Proxy Port", adminVitaPort.Text)
+		if err != nil {
+			dialog.ShowError(err, w)
+			adminStatus.SetText("Input error: " + err.Error())
+			return
+		}
+		proxyBase, err := parsePositiveIntField("Proxy Base Port", adminProxyBasePort.Text)
+		if err != nil {
+			dialog.ShowError(err, w)
+			adminStatus.SetText("Input error: " + err.Error())
+			return
+		}
+
+		installCommand := strings.TrimSpace(adminInstallCommand.Text)
+		if strings.TrimSpace(installCommandOverride) != "" {
+			installCommand = strings.TrimSpace(installCommandOverride)
+		}
+
+		req := adminBatchRequest{
+			Targets:        targets,
+			SSHPassword:    adminSSHPassword.Text,
+			SudoPassword:   adminSudoPassword.Text,
+			InstallCommand: installCommand,
+			ServiceName:    strings.TrimSpace(adminServiceName.Text),
+			BinaryPath:     strings.TrimSpace(adminBinaryPath.Text),
+			FlexToolConfig: adminFlexToolConfig{
+				Broadcast:             adminBroadcast.Checked,
+				ListenInterface:       strings.TrimSpace(adminListenIF.Text),
+				SendInterface:         strings.TrimSpace(adminSendIF.Text),
+				Debug:                 adminDebug.Checked,
+				NetBirdAPIToken:       strings.TrimSpace(adminAPIToken.Text),
+				NetBirdAPIURL:         strings.TrimSpace(adminAPIURL.Text),
+				DiscoveryDelaySeconds: discoveryDelay,
+				SyncIntervalSeconds:   syncInterval,
+				IgnoreRadios:          strings.TrimSpace(adminIgnoreRadios.Text),
+				EnableVitaProxy:       adminEnableVita.Checked,
+				VitaProxyPort:         vitaPort,
+				ProxyBasePort:         proxyBase,
+				MultiProxy:            adminMultiProxy.Checked,
+			},
+			ApplyConfig:    applyConfig,
+			InstallService: installService,
+			RestartService: restartService,
+			RunInstallCmd:  runInstall && installCommand != "",
+		}
+
+		adminStatus.SetText("Running...")
+		appendAdminLog("Starting batch run...")
+		go func() {
+			okCount, failCount := runAdminBatch(req, appendAdminLog)
+			fyne.Do(func() {
+				adminStatus.SetText(fmt.Sprintf("Done. Success=%d Failed=%d", okCount, failCount))
+			})
+		}()
+	}
+
+	adminApplyConfigBtn := widget.NewButton("Apply Config To All", func() {
+		runAdminAction(true, false, false, false, "")
+	})
+	adminInstallCmdBtn := widget.NewButton("Run Install Cmd On All", func() {
+		runAdminAction(false, true, false, false, "")
+	})
+	adminInstallSvcBtn := widget.NewButton("Install/Repair Service", func() {
+		runAdminAction(false, false, true, false, "")
+	})
+	adminRestartSvcBtn := widget.NewButton("Restart Service", func() {
+		runAdminAction(false, false, false, true, "")
+	})
+	adminFullBtn := widget.NewButton("Full Apply (Install Cmd + Config + Service + Restart)", func() {
+		runAdminAction(true, true, true, true, "")
+	})
+	adminAutoBootstrapBtn := widget.NewButton("Auto Bootstrap + Deploy", func() {
+		cmd := buildAutoBootstrapCommand(
+			adminRepoURL.Text,
+			adminSourceDir.Text,
+			adminBuildOutput.Text,
+			adminBinaryPath.Text,
+			func() string {
+				if strings.TrimSpace(adminSudoPassword.Text) != "" {
+					return adminSudoPassword.Text
+				}
+				return adminSSHPassword.Text
+			}(),
+		)
+		runAdminAction(true, true, true, true, cmd)
+	})
+
+	adminConfigForm := widget.NewForm(
+		widget.NewFormItem("Servers", adminServersEntry),
+		widget.NewFormItem("Default SSH User", adminDefaultUser),
+		widget.NewFormItem("SSH Password", adminSSHPassword),
+		widget.NewFormItem("Sudo Password", adminSudoPassword),
+		widget.NewFormItem("Repo URL", adminRepoURL),
+		widget.NewFormItem("Source Dir", adminSourceDir),
+		widget.NewFormItem("Build Output", adminBuildOutput),
+		widget.NewFormItem("Install Command", adminInstallCommand),
+		widget.NewFormItem("Service Name", adminServiceName),
+		widget.NewFormItem("Server Binary Path", adminBinaryPath),
+		widget.NewFormItem("BROADCAST", adminBroadcast),
+		widget.NewFormItem("LISTEN_INTERFACE", adminListenIF),
+		widget.NewFormItem("SEND_INTERFACE", adminSendIF),
+		widget.NewFormItem("DEBUG", adminDebug),
+		widget.NewFormItem("NETBIRD_API_TOKEN", adminAPIToken),
+		widget.NewFormItem("NETBIRD_API_URL", adminAPIURL),
+		widget.NewFormItem("DISCOVERY_DELAY_SECONDS", adminDiscoveryDelay),
+		widget.NewFormItem("SYNC_INTERVAL_SECONDS", adminSyncInterval),
+		widget.NewFormItem("IGNORE_RADIOS", adminIgnoreRadios),
+		widget.NewFormItem("ENABLE_VITA_PROXY", adminEnableVita),
+		widget.NewFormItem("VITA_PROXY_PORT", adminVitaPort),
+		widget.NewFormItem("PROXY_BASE_PORT", adminProxyBasePort),
+		widget.NewFormItem("MULTI_PROXY", adminMultiProxy),
+	)
+
+	adminPage := container.NewBorder(
+		container.NewVBox(
+			adminHeader,
+			adminHint,
+			adminStatus,
+			container.NewHBox(adminAutoBootstrapBtn),
+			container.NewHBox(adminApplyConfigBtn, adminInstallCmdBtn, adminInstallSvcBtn),
+			container.NewHBox(adminRestartSvcBtn, adminFullBtn),
+			widget.NewSeparator(),
+		),
+		nil,
+		nil,
+		nil,
+		container.NewVScroll(container.NewVBox(adminConfigForm, widget.NewSeparator(), adminLog)),
+	)
+
+	// Refresh function so Firewall status never gets "stuck on checking..."
+	refreshFirewallStatus := func() {
+		checkID := atomic.AddUint64(&firewallCheckGeneration, 1)
+
+		// set visible immediate state
+		firewallLabel.SetText("Firewall: checking...")
+		firewallFixBtn.Disable()
+
+		go func(id uint64) {
+			exePath, err := os.Executable()
+			if err != nil {
+				fyne.Do(func() {
+					if id != atomic.LoadUint64(&firewallCheckGeneration) {
+						return
+					}
+					firewallLabel.SetText("Firewall: unable to detect EXE path")
+					firewallFixBtn.Enable()
+				})
+				return
+			}
+
+			chk, err := CheckFirewallRule(exePath)
+			fyne.Do(func() {
+				if id != atomic.LoadUint64(&firewallCheckGeneration) {
+					return
+				}
+				if err != nil {
+					firewallLabel.SetText("Firewall: check failed (click Fix)")
+					firewallFixBtn.Enable()
+					return
+				}
+				if !chk.Exists {
+					firewallLabel.SetText("Firewall: rule missing")
+					firewallFixBtn.Enable()
+					return
+				}
+				if !chk.InboundRuleFound {
+					firewallLabel.SetText("Firewall: inbound rule missing")
+					firewallFixBtn.Enable()
+					return
+				}
+				if !chk.ProgramMatches {
+					firewallLabel.SetText("Firewall: rule points to a different EXE path")
+					firewallFixBtn.Enable()
+					return
+				}
+				if !chk.InboundRuleOK {
+					firewallLabel.SetText("Firewall: inbound rule needs correction")
+					firewallFixBtn.Enable()
+					return
+				}
+
+				firewallLabel.SetText("Firewall: OK")
+				firewallFixBtn.Disable()
+			})
+		}(checkID)
+	}
+
+	// Fix button (UAC prompt happens here ONLY)
+	firewallFixBtn.OnTapped = func() {
+		atomic.AddUint64(&firewallCheckGeneration, 1)
+
+		exePath, err := os.Executable()
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("cannot locate current executable: %w", err), w)
+			return
+		}
+
+		firewallFixBtn.Disable()
+		firewallFixBtn.SetText("Fixing...")
+
+		go func() {
+			err := EnsureFirewallRule(exePath)
+
+			fyne.Do(func() {
+				firewallFixBtn.SetText("Fix Firewall Rule")
+				if err != nil {
+					firewallLabel.SetText("Firewall: fix failed")
+					firewallFixBtn.Enable()
+					dialog.ShowError(err, w)
+					return
+				}
+
+				refreshFirewallStatus()
+				dialog.ShowInformation("Firewall", "Firewall rule added/updated successfully.", w)
+			})
+		}()
+	}
 
 	// Resolve NetBird version in background
 	go func() {
@@ -530,173 +1042,26 @@ func Run() {
 		})
 	}()
 
-	// Auto-check for updates on startup (background)
-	go func() {
-		rel, err := fetchLatestRelease()
-		if err != nil {
-			log.Printf("Updates: initial check failed: %v", err)
-			fyne.Do(func() {
-				latestVersionLabel.SetText("Latest available: unknown")
-			})
-			return
-		}
-
-		latestTag := normalizeVersion(rel.TagName)
-		currentTag := normalizeVersion(Version)
-		newer := isNewerVersion(currentTag, latestTag)
-
-		fyne.Do(func() {
-			latestVersionLabel.SetText("Latest available: " + latestTag)
-			if newer {
-				updateBtn.SetText("Update Available")
-				dialog.ShowInformation(
-					"Update Available",
-					fmt.Sprintf("A new version is available.\nCurrent: %s\nLatest: %s\n\nOpen About and click \"Update Available\" to install.",
-						currentTag, latestTag),
-					w,
-				)
-			}
-		})
-	}()
-
-	// Update behavior (About page)
-	updateBtn.OnTapped = func() {
-		log.Printf("GUI: Check for Updates clicked")
-
-		if runtime.GOOS != "windows" {
-			dialog.ShowInformation("Updates", "Auto-update is only implemented for Windows binaries.", w)
-			return
-		}
-
-		go func() {
-			fyne.Do(func() {
-				updateBtn.Disable()
-				updateBtn.SetText("Checking…")
-			})
-
-			rel, err := fetchLatestRelease()
-			if err != nil {
-				log.Printf("Updates: check failed: %v", err)
-				fyne.Do(func() {
-					updateBtn.SetText("Check for Updates")
-					updateBtn.Enable()
-					dialog.ShowError(err, w)
-				})
-				return
-			}
-
-			latestTag := normalizeVersion(rel.TagName)
-			currentTag := normalizeVersion(Version)
-
-			if !isNewerVersion(currentTag, latestTag) {
-				log.Printf("Updates: no update (current=%s latest=%s)", currentTag, latestTag)
-				fyne.Do(func() {
-					updateBtn.SetText("Check for Updates")
-					updateBtn.Enable()
-					latestVersionLabel.SetText("Latest available: " + latestTag)
-					dialog.ShowInformation("Updates",
-						fmt.Sprintf("You are up to date.\nCurrent: %s\nLatest: %s", currentTag, latestTag), w)
-				})
-				return
-			}
-
-			log.Printf("Updates: new version available (current=%s latest=%s)", currentTag, latestTag)
-
-			downloadURL, ok := findUpdateAsset(rel)
-			if !ok {
-				log.Printf("Updates: no asset named %s", updateAssetName)
-				fyne.Do(func() {
-					updateBtn.SetText("Check for Updates")
-					updateBtn.Enable()
-					latestVersionLabel.SetText("Latest available: " + latestTag)
-					dialog.ShowInformation("Updates",
-						fmt.Sprintf("New version %s is available, but no %s asset was found.", latestTag, updateAssetName), w)
-				})
-				return
-			}
-
-			fyne.Do(func() {
-				dialog.ShowConfirm(
-					"Update Available",
-					fmt.Sprintf("A new version is available.\nCurrent: %s\nLatest: %s\n\nDownload and install now?",
-						currentTag, latestTag),
-					func(ok bool) {
-						if !ok {
-							log.Printf("Updates: user declined update")
-							updateBtn.SetText("Check for Updates")
-							updateBtn.Enable()
-							latestVersionLabel.SetText("Latest available: " + latestTag)
-							return
-						}
-
-						go func() {
-							fyne.Do(func() {
-								updateBtn.SetText("Downloading…")
-								updateBtn.Disable()
-							})
-
-							exePath, err := os.Executable()
-							if err != nil {
-								log.Printf("Updates: os.Executable failed: %v", err)
-								fyne.Do(func() {
-									updateBtn.SetText("Check for Updates")
-									updateBtn.Enable()
-									dialog.ShowError(fmt.Errorf("cannot locate current executable: %w", err), w)
-								})
-								return
-							}
-
-							dir := filepath.Dir(exePath)
-							newExe := filepath.Join(dir, "flexclient-gui.new.exe")
-
-							if err := downloadFile(downloadURL, newExe); err != nil {
-								log.Printf("Updates: download failed: %v", err)
-								fyne.Do(func() {
-									updateBtn.SetText("Check for Updates")
-									updateBtn.Enable()
-									dialog.ShowError(fmt.Errorf("download failed: %w", err), w)
-								})
-								return
-							}
-
-							if err := runWindowsUpdateBatch(exePath, newExe); err != nil {
-								log.Printf("Updates: starting updater batch failed: %v", err)
-								fyne.Do(func() {
-									updateBtn.SetText("Check for Updates")
-									updateBtn.Enable()
-									dialog.ShowError(fmt.Errorf("failed to start updater: %w", err), w)
-								})
-								return
-							}
-
-							log.Printf("Updates: batch started, exiting")
-							os.Exit(0)
-						}()
-					},
-					w,
-				)
-			})
-		}()
-	}
-
 	// ---------- Left menu + content switching ----------
-
-	menuItems := []string{"Flexclient", "About"}
-
 	contentStack := container.NewMax(flexclientPage) // default view
 
-	menu := widget.NewList(
-		func() int {
-			return len(menuItems)
-		},
-		func() fyne.CanvasObject {
-			return widget.NewLabel("")
-		},
+	menu = widget.NewList(
+		func() int { return len(menuItems) },
+		func() fyne.CanvasObject { return widget.NewLabel("") },
 		func(i widget.ListItemID, o fyne.CanvasObject) {
-			label := o.(*widget.Label)
-			label.SetText(menuItems[i])
+			o.(*widget.Label).SetText(menuItems[i])
 		},
 	)
+
+	refreshMenuItems = func() {
+		base := []string{"Flexclient", "Settings", "Help", "About"}
+		if adminUnlocked {
+			base = append(base, "Admin")
+		}
+		menuItems = base
+		menu.Refresh()
+	}
+	refreshMenuItems()
 
 	menu.OnSelected = func(id widget.ListItemID) {
 		if id < 0 || int(id) >= len(menuItems) {
@@ -705,8 +1070,35 @@ func Run() {
 		switch menuItems[id] {
 		case "Flexclient":
 			contentStack.Objects = []fyne.CanvasObject{flexclientPage}
+		case "Settings":
+			contentStack.Objects = []fyne.CanvasObject{settingsPage}
+		case "Help":
+			contentStack.Objects = []fyne.CanvasObject{helpPage}
+		case "Admin":
+			contentStack.Objects = []fyne.CanvasObject{adminPage}
 		case "About":
 			contentStack.Objects = []fyne.CanvasObject{aboutPage}
+			// Update firewall status whenever About is opened
+			refreshFirewallStatus()
+			// Hidden admin unlock: select About repeatedly within a short window.
+			now := time.Now()
+			if now.Sub(aboutSelectLastTap) <= 5*time.Second {
+				aboutSelectTapCount++
+			} else {
+				aboutSelectTapCount = 1
+			}
+			aboutSelectLastTap = now
+			if !adminUnlocked && aboutSelectTapCount >= 9 {
+				adminUnlocked = true
+				log.Printf("GUI: hidden admin page unlocked via About multi-select")
+				if refreshMenuItems != nil {
+					refreshMenuItems()
+				}
+				dialog.ShowInformation("Advanced", "Advanced tools unlocked.", w)
+			}
+			// Allow repeated About clicks to trigger OnSelected again without
+			// requiring the user to switch to another menu item first.
+			menu.Unselect(id)
 		}
 		contentStack.Refresh()
 	}
@@ -714,12 +1106,21 @@ func Run() {
 	// select Flexclient by default
 	menu.Select(0)
 
-	// Two-pane layout: left menu, right content
-	split := container.NewHSplit(menu, contentStack)
-	split.Offset = 0.2 // 20% left, 80% right
+	// Two-pane layout with fixed-width left nav so route expansion cannot
+	// collapse/shrink the menu area.
+	navWidthShim := canvas.NewRectangle(color.Transparent)
+	navWidthShim.SetMinSize(fyne.NewSize(180, 1))
+	navPanel := container.NewStack(navWidthShim, menu)
+	mainLayout := container.NewBorder(nil, nil, navPanel, nil, contentStack)
 
-	w.SetContent(split)
+	w.SetContent(mainLayout)
 	log.Printf("GUI: content set (left menu + right pages), entering ShowAndRun")
+
+	// Also run firewall refresh once after UI is live (so it's ready when you open About)
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		fyne.Do(refreshFirewallStatus)
+	}()
 
 	w.ShowAndRun()
 }
