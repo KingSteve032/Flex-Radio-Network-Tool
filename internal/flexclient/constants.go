@@ -28,8 +28,12 @@ const (
 	discoveryRebroadcastInterval = 1 * time.Second
 
 	// Drop cached discoveries after this age so stale radios naturally disappear.
-	// Keep this generously high to tolerate upstream discovery jitter.
-	discoveryCacheMaxAge = 5 * time.Minute
+	// Keep this bounded so renamed/moved radios do not keep old identities alive.
+	discoveryCacheMaxAge = 20 * time.Second
+
+	// Re-broadcast only recently seen discoveries. This prevents stale cache
+	// packets from flip-flopping radio metadata (nickname/callsign).
+	discoveryCacheRebroadcastFreshAge = 4 * time.Second
 
 	// If the same radio serial is seen from multiple routes, keep one route as
 	// the owner for this long before allowing takeover. This prevents SmartSDR

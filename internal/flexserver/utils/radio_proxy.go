@@ -27,6 +27,7 @@ type proxySession struct {
 	Serial   string
 	RadioIP  string
 	UDPPort  int
+	LastSeen time.Time
 	mu       sync.RWMutex
 	closeNow func()
 }
@@ -226,6 +227,7 @@ func handleProxyConnection(clientConn net.Conn, serial string, co ConfigOptions)
 		Serial:   serial,
 		RadioIP:  ep.IP,
 		UDPPort:  4991, // default until client udpport command is seen
+		LastSeen: time.Now(),
 	}
 	sessionsByRadio.Store(ep.IP, session)
 
@@ -249,7 +251,7 @@ func handleProxyConnection(clientConn net.Conn, serial string, co ConfigOptions)
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(clientConn, radioConn)
+		_, _ = io.Copy(io.MultiWriter(clientConn, &sessionActivityWriter{session: session}), radioConn)
 		closeBoth()
 	}()
 
@@ -340,6 +342,9 @@ func (s *udpPortSniffer) Write(p []byte) (int, error) {
 	if s == nil || s.session == nil || len(p) == 0 {
 		return len(p), nil
 	}
+	s.session.mu.Lock()
+	s.session.LastSeen = time.Now()
+	s.session.mu.Unlock()
 
 	chunk := strings.ToLower(string(p))
 	s.buf += chunk
@@ -369,6 +374,7 @@ func (s *udpPortSniffer) Write(p []byte) (int, error) {
 		if port, err := strconv.Atoi(pRaw); err == nil && port > 0 && port < 65536 {
 			s.session.mu.Lock()
 			s.session.UDPPort = port
+			s.session.LastSeen = time.Now()
 			s.session.mu.Unlock()
 			fmt.Printf("[PROXY] serial=%s client udpport=%d\n", s.session.Serial, port)
 		}
@@ -382,6 +388,20 @@ func (s *udpPortSniffer) Write(p []byte) (int, error) {
 func proxyClientToRadioWithUDPPortTracking(src net.Conn, dst net.Conn, session *proxySession, _ bool) {
 	sniffer := &udpPortSniffer{session: session}
 	_, _ = io.Copy(io.MultiWriter(dst, sniffer), src)
+}
+
+type sessionActivityWriter struct {
+	session *proxySession
+}
+
+func (w *sessionActivityWriter) Write(p []byte) (int, error) {
+	if w == nil || w.session == nil {
+		return len(p), nil
+	}
+	w.session.mu.Lock()
+	w.session.LastSeen = time.Now()
+	w.session.mu.Unlock()
+	return len(p), nil
 }
 
 func parseClientUDPPortCommand(line []byte) (int, bool) {
@@ -415,6 +435,9 @@ func GetVitaProxyTarget(radioIP string) (clientIP string, clientPort int, ok boo
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if time.Since(s.LastSeen) > 30*time.Second {
+		return "", 0, false
+	}
 	if s.ClientIP == "" || s.UDPPort <= 0 {
 		return "", 0, false
 	}

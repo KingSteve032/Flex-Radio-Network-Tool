@@ -160,3 +160,15 @@ The script auto-detects architecture and installs:
 - `frnt-linux-armv7`
 
 Then it restarts `frnt-listen.service`.
+
+## Client Installers (Stable Install Path)
+
+To keep client updates in the same location every time:
+
+- Windows (installs to `C:\Program Files\Flex Radio Network Tool\frnt.exe`):
+  - `powershell -ExecutionPolicy Bypass -File scripts/install-client-windows.ps1`
+  - Specific release: `powershell -ExecutionPolicy Bypass -File scripts/install-client-windows.ps1 -Version v0.2.6`
+
+- macOS (installs to `/Applications/Flex Radio Network Tool/frnt`):
+  - `bash scripts/install-client-macos.sh`
+  - Specific release: `bash scripts/install-client-macos.sh v0.2.6`

@@ -351,6 +351,40 @@ func maybeSendProxySelect(conn *net.UDPConn, routeID, clientIP, serial string) {
 	log.Printf("flexclient[%s]: sent PROXY_SELECT serial=%s", routeID, serial)
 }
 
+func sendProxySelectForActiveTCPProxy(serverIP, serial string) {
+	serverIP = strings.TrimSpace(serverIP)
+	serial = strings.ToLower(strings.TrimSpace(serial))
+	if serverIP == "" || serial == "" {
+		return
+	}
+
+	addr := &net.UDPAddr{
+		IP:   net.ParseIP(serverIP),
+		Port: serverPort,
+	}
+	if addr.IP == nil {
+		return
+	}
+
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	localAddr, _ := conn.LocalAddr().(*net.UDPAddr)
+	clientIP := ""
+	if localAddr != nil && localAddr.IP != nil {
+		clientIP = strings.TrimSpace(localAddr.IP.String())
+	}
+	if clientIP == "" {
+		return
+	}
+
+	msg := fmt.Sprintf("PROXY_SELECT client_ip=%s serial=%s", clientIP, serial)
+	_, _ = conn.Write([]byte(msg))
+}
+
 func claimSerialOwner(routeID, serial string, now time.Time) bool {
 	serial = strings.ToLower(strings.TrimSpace(serial))
 	routeID = strings.TrimSpace(routeID)
@@ -603,6 +637,8 @@ func bridgeLocalProxyConn(lp *localProxyListener, clientConn net.Conn) {
 		return
 	}
 	defer serverConn.Close()
+
+	sendProxySelectForActiveTCPProxy(lp.serverIP, lp.serial)
 
 	var wg sync.WaitGroup
 	var closeOnce sync.Once
@@ -1005,8 +1041,6 @@ func applyDiscoveryModeAndBroadcast(
 
 		rewritten, _, err := rewriteDiscoveryForProxy(payload, localIP, broadcastPort)
 		if err == nil {
-			// Keep PROXY_SELECT for compatibility with shared server listener.
-			maybeSendProxySelect(conn, routeID, clientIP, serial)
 			if logRewrite && discoveryText != "" {
 				origIP := fieldValue(discoveryText, "ip")
 				origPort := fieldValue(discoveryText, "port")
@@ -1039,6 +1073,9 @@ func rebroadcastCachedDiscoveries(
 	for key, entry := range cache {
 		if now.Sub(entry.lastSeen) > discoveryCacheMaxAge {
 			delete(cache, key)
+			continue
+		}
+		if now.Sub(entry.lastSeen) > discoveryCacheRebroadcastFreshAge {
 			continue
 		}
 		if !claimSerialOwner(route.ID, entry.serial, now) {
