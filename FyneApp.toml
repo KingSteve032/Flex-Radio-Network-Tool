@@ -1,0 +1,5 @@
+Website = "https://github.com/KingSteve032/Flex-Radio-Network-Tool"
+Details = "Flex Radio Network Tool client and server suite."
+Icon = "assets/icon.png"
+Name = "Flex Radio Network Tool"
+ID = "org.w4car.flexradiotool"

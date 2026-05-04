@@ -181,6 +181,36 @@ func getSmartSDRVersion() (string, error) {
 	return "", fmt.Errorf("SmartSDR not found in winget list output")
 }
 
+func loadAppIcon() fyne.Resource {
+	exePath, _ := os.Executable()
+	exeDir := filepath.Dir(exePath)
+	cwd, _ := os.Getwd()
+
+	candidates := []string{
+		filepath.Join(exeDir, "icon.png"),
+		filepath.Join(exeDir, "assets", "icon.png"),
+		filepath.Join(cwd, "assets", "icon.png"),
+	}
+
+	for _, p := range candidates {
+		if p == "" {
+			continue
+		}
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		res, err := fyne.LoadResourceFromPath(p)
+		if err != nil {
+			continue
+		}
+		log.Printf("GUI: loaded app icon from %s", p)
+		return res
+	}
+
+	log.Printf("GUI: app icon not found (looked in icon.png and assets/icon.png)")
+	return nil
+}
+
 // --- GUI entrypoint ---
 
 func Run() {
@@ -194,7 +224,14 @@ func Run() {
 
 	log.Printf("GUI: initializing Fyne app")
 	a := app.New()
+	icon := loadAppIcon()
+	if icon != nil {
+		a.SetIcon(icon)
+	}
 	w := a.NewWindow(AppName)
+	if icon != nil {
+		w.SetIcon(icon)
+	}
 	w.Resize(fyne.NewSize(800, 450))
 	log.Printf("GUI: window created")
 

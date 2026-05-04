@@ -100,6 +100,23 @@ For CI/release builds, version metadata is injected via `-ldflags`:
 - `Version` (tag like `v0.2.0`)
 - `Commit` (short SHA)
 - `BuildDate` (UTC timestamp)
+- Local/dev default version comes from `internal/buildinfo/buildinfo.go`.
+
+## App Icon (`icon.png`)
+
+- Runtime window/app icon is loaded from:
+  - `icon.png` next to executable, or
+  - `assets/icon.png`
+- Fyne packaging metadata is in `FyneApp.toml` with:
+  - `Icon = "assets/icon.png"`
+
+If you package desktop apps manually with Fyne, the icon metadata is picked up automatically:
+
+```bash
+go install fyne.io/tools/cmd/fyne@latest
+fyne package -os windows -release
+fyne package -os darwin -release
+```
 
 ## GitHub Releases
 
