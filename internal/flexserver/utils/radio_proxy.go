@@ -91,6 +91,14 @@ func getSelectedSerialForClient(clientIP string) (string, bool) {
 	return s, true
 }
 
+func clearSelectedSerialForClient(clientIP string) {
+	clientIP = strings.TrimSpace(clientIP)
+	if clientIP == "" {
+		return
+	}
+	selectedSerialByClient.Delete(clientIP)
+}
+
 func getAnyDiscoveredSerial() (string, bool) {
 	found := ""
 	discoveredRadios.Range(func(key, _ any) bool {
@@ -333,6 +341,21 @@ func deleteSessionIfCurrent(radioIP string, current *proxySession) {
 	}
 }
 
+func terminateSession(session *proxySession, reason string) {
+	if session == nil {
+		return
+	}
+	if reason != "" {
+		fmt.Printf("[PROXY] terminating session serial=%s client=%s radio=%s reason=%s\n",
+			session.Serial, session.ClientIP, session.RadioIP, reason)
+	}
+	clearSelectedSerialForClient(session.ClientIP)
+	deleteSessionIfCurrent(session.RadioIP, session)
+	if session.closeNow != nil {
+		session.closeNow()
+	}
+}
+
 type udpPortSniffer struct {
 	session *proxySession
 	buf     string
@@ -348,8 +371,8 @@ func (s *udpPortSniffer) Write(p []byte) (int, error) {
 
 	chunk := strings.ToLower(string(p))
 	s.buf += chunk
-	if len(s.buf) > 1024 {
-		s.buf = s.buf[len(s.buf)-1024:]
+	if len(s.buf) > 4096 {
+		s.buf = s.buf[len(s.buf)-4096:]
 	}
 
 	const needle = "client udpport "
@@ -380,6 +403,13 @@ func (s *udpPortSniffer) Write(p []byte) (int, error) {
 		}
 
 		s.buf = s.buf[end:]
+	}
+
+	// SmartSDR sends plain-text TCP commands. If we see a disconnect command,
+	// terminate this proxy session immediately so stale VITA does not continue
+	// after a rapid radio switch.
+	if strings.Contains(s.buf, "disconnect") {
+		terminateSession(s.session, "disconnect command observed")
 	}
 
 	return len(p), nil
@@ -440,6 +470,11 @@ func GetVitaProxyTarget(radioIP string) (clientIP string, clientPort int, ok boo
 	}
 	if s.ClientIP == "" || s.UDPPort <= 0 {
 		return "", 0, false
+	}
+	if selectedSerial, hasSelection := getSelectedSerialForClient(s.ClientIP); hasSelection {
+		if normalizeSerial(selectedSerial) != normalizeSerial(s.Serial) {
+			return "", 0, false
+		}
 	}
 	return s.ClientIP, s.UDPPort, true
 }

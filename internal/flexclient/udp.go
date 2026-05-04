@@ -463,6 +463,16 @@ func extractDiscoveryText(raw []byte) (vrt.VRT, string, error) {
 	return v, text, nil
 }
 
+func isModernDiscoveryPayload(payload string) bool {
+	payload = strings.TrimSpace(payload)
+	if payload == "" {
+		return false
+	}
+	// Prefer the modern protocol/status payload to avoid nickname/callsign
+	// flip-flopping from mixed legacy discovery formats.
+	return strings.Contains(payload, "discovery_protocol_version=")
+}
+
 func fieldValue(payload, key string) string {
 	prefix := key + "="
 	for _, tok := range strings.Fields(payload) {
@@ -1188,6 +1198,9 @@ func runForServer(ctx context.Context, route Route, version string) {
 
 		serial := strings.ToLower(strings.TrimSpace(fieldValue(discoveryText, "serial")))
 		if serial == "" {
+			continue
+		}
+		if !isModernDiscoveryPayload(discoveryText) {
 			continue
 		}
 
