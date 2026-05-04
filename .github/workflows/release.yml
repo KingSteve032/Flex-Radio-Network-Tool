@@ -27,12 +27,12 @@ jobs:
             goarch: amd64
             arch_label: amd64
             ext: ".exe"
-          - runner: macos-13
+          - runner: macos-latest
             goos: darwin
             goarch: amd64
             arch_label: amd64
             ext: ""
-          - runner: macos-14
+          - runner: macos-latest
             goos: darwin
             goarch: arm64
             arch_label: arm64
