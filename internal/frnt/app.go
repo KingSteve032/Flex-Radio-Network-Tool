@@ -5,12 +5,17 @@ package frnt
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"image/color"
+	"io"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -36,9 +41,19 @@ const (
 	heartbeatListUpdate  = 1 * time.Second
 	discoveryActiveFor   = 10 * time.Second // RX "active" window
 	netbirdStatusTimeout = 5 * time.Second
+	updateCheckTimeout   = 8 * time.Second
 
 	// fallback SmartSDR version (used only if winget detection fails)
 	SmartSDRVersionFallback = "Unknown"
+	releaseRepoFullName     = "KingSteve032/Flex-Radio-Network-Tool"
+	smartSDRPaidMacURL      = "https://apps.apple.com/us/app/smartsdr-flexradio-systems/id1523656696?mt=12"
+	aetherSDRRepoURL        = "https://github.com/ten9876/AetherSDR"
+	w4carSmartSDRDefaultURL = "https://www.w4car.org/it-network"
+)
+
+var (
+	w4carSmartSDRVersionRe = regexp.MustCompile(`SmartSDR Version:\s*([0-9]+(?:\.[0-9]+){1,3})`)
+	version3Re             = regexp.MustCompile(`([0-9]+)\.([0-9]+)\.([0-9]+)`)
 )
 
 // --- logging setup ---
@@ -179,6 +194,225 @@ func getSmartSDRVersion() (string, error) {
 	}
 
 	return "", fmt.Errorf("SmartSDR not found in winget list output")
+}
+
+type latestReleaseResponse struct {
+	TagName string `json:"tag_name"`
+	HTMLURL string `json:"html_url"`
+}
+
+func parseVersionTriplet(raw string) (major, minor, patch int, err error) {
+	v := strings.TrimSpace(raw)
+	v = strings.TrimPrefix(strings.TrimPrefix(v, "v"), "V")
+	parts := strings.Split(v, ".")
+	if len(parts) < 3 {
+		return 0, 0, 0, fmt.Errorf("invalid version format: %q", raw)
+	}
+
+	parsePart := func(p string) (int, error) {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return 0, fmt.Errorf("empty version part")
+		}
+		end := 0
+		for end < len(p) && p[end] >= '0' && p[end] <= '9' {
+			end++
+		}
+		if end == 0 {
+			return 0, fmt.Errorf("missing numeric prefix in %q", p)
+		}
+		return strconv.Atoi(p[:end])
+	}
+
+	major, err = parsePart(parts[0])
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	minor, err = parsePart(parts[1])
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	patch, err = parsePart(parts[2])
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return major, minor, patch, nil
+}
+
+func compareVersions(current, latest string) (int, error) {
+	cMaj, cMin, cPat, err := parseVersionTriplet(current)
+	if err != nil {
+		return 0, err
+	}
+	lMaj, lMin, lPat, err := parseVersionTriplet(latest)
+	if err != nil {
+		return 0, err
+	}
+
+	switch {
+	case cMaj < lMaj:
+		return -1, nil
+	case cMaj > lMaj:
+		return 1, nil
+	case cMin < lMin:
+		return -1, nil
+	case cMin > lMin:
+		return 1, nil
+	case cPat < lPat:
+		return -1, nil
+	case cPat > lPat:
+		return 1, nil
+	default:
+		return 0, nil
+	}
+}
+
+func fetchLatestRelease(ctx context.Context) (tagName, htmlURL string, err error) {
+	endpoint := "https://api.github.com/repos/" + releaseRepoFullName + "/releases/latest"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "frnt/"+buildinfo.Short())
+
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", "", fmt.Errorf("GitHub API status %d", resp.StatusCode)
+	}
+
+	var payload latestReleaseResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", "", err
+	}
+	if strings.TrimSpace(payload.TagName) == "" {
+		return "", "", fmt.Errorf("latest release missing tag_name")
+	}
+	if strings.TrimSpace(payload.HTMLURL) == "" {
+		payload.HTMLURL = "https://github.com/" + releaseRepoFullName + "/releases/latest"
+	}
+
+	return strings.TrimSpace(payload.TagName), strings.TrimSpace(payload.HTMLURL), nil
+}
+
+func smartSDRWindowsURL() string {
+	if v := strings.TrimSpace(os.Getenv("SMARTSDR_WINDOWS_URL")); v != "" {
+		return v
+	}
+	return w4carSmartSDRDefaultURL
+}
+
+func normalizeVersion3(raw string) string {
+	m := version3Re.FindStringSubmatch(strings.TrimSpace(raw))
+	if len(m) != 4 {
+		return ""
+	}
+	return fmt.Sprintf("%s.%s.%s", m[1], m[2], m[3])
+}
+
+func fetchW4CARSmartSDRTargetVersion(ctx context.Context) (string, error) {
+	pageURL := smartSDRWindowsURL()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "frnt/"+buildinfo.Short())
+
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("W4CAR page returned status %d", resp.StatusCode)
+	}
+
+	var b strings.Builder
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		b.WriteString(scanner.Text())
+		b.WriteByte('\n')
+	}
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+
+	m := w4carSmartSDRVersionRe.FindStringSubmatch(b.String())
+	if len(m) < 2 {
+		return "", fmt.Errorf("could not find SmartSDR Version on W4CAR page")
+	}
+	return strings.TrimSpace(m[1]), nil
+}
+
+func installSmartSDRWindowsVersion(targetVersion string) (string, error) {
+	targetVersion = strings.TrimSpace(targetVersion)
+	if targetVersion == "" {
+		return "", fmt.Errorf("target version is empty")
+	}
+	installVersion := targetVersion
+	if norm := normalizeVersion3(targetVersion); norm != "" {
+		installVersion = norm
+	}
+	downloadURL := fmt.Sprintf("https://smartsdr.flexradio.com/SmartSDR_v%s_x64.msi", installVersion)
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, downloadURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "frnt/"+buildinfo.Short())
+	resp, err := (&http.Client{Timeout: 10 * time.Minute}).Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("download failed with status %d from %s", resp.StatusCode, downloadURL)
+	}
+
+	tmpFile, err := os.CreateTemp("", "smartsdr-*.msi")
+	if err != nil {
+		return "", err
+	}
+	tmpPath := tmpFile.Name()
+	defer func() {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+	}()
+
+	if _, err := io.Copy(tmpFile, resp.Body); err != nil {
+		return "", err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return "", err
+	}
+
+	args := []string{"/i", tmpPath, "/passive", "/norestart"}
+	cmd := exec.Command("msiexec", args...)
+	procutil.HideWindow(cmd)
+	out, err := cmd.CombinedOutput()
+	combined := strings.TrimSpace(string(out))
+	if combined == "" {
+		combined = "(no installer output)"
+	}
+	combined = fmt.Sprintf("Downloaded: %s\nInstaller: msiexec %s\n%s", downloadURL, strings.Join(args, " "), combined)
+
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			code := exitErr.ExitCode()
+			// 3010/1641 are successful installs that require reboot.
+			if code == 3010 || code == 1641 {
+				return combined + fmt.Sprintf("\nInstaller exit code %d (reboot required).", code), nil
+			}
+		}
+		return combined, fmt.Errorf("SmartSDR installer failed: %w", err)
+	}
+	return combined, nil
 }
 
 func loadAppIcon() fyne.Resource {
@@ -631,6 +865,149 @@ func Run() {
 
 	netbirdVersionLabel := widget.NewLabel("NetBird: detecting...")
 	smartSDRLabel := widget.NewLabel("SmartSDR Version: detecting...")
+	smartInstallLabel := widget.NewLabel("SmartSDR Install: choose source below")
+	updateLabel := widget.NewLabel("Update: not checked yet")
+
+	latestReleaseURL := ""
+	openReleaseBtn := widget.NewButton("Open Latest Release", func() {
+		target := strings.TrimSpace(latestReleaseURL)
+		if target == "" {
+			target = "https://github.com/" + releaseRepoFullName + "/releases/latest"
+		}
+		u, err := url.Parse(target)
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("invalid release URL: %w", err), w)
+			return
+		}
+		if err := a.OpenURL(u); err != nil {
+			dialog.ShowError(fmt.Errorf("unable to open release URL: %w", err), w)
+		}
+	})
+	openReleaseBtn.Disable()
+	checkUpdateBtn := widget.NewButton("Check For Updates", nil)
+
+	openURL := func(rawURL, failPrefix string) {
+		u, err := url.Parse(strings.TrimSpace(rawURL))
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("%s: invalid URL: %w", failPrefix, err), w)
+			return
+		}
+		if err := a.OpenURL(u); err != nil {
+			dialog.ShowError(fmt.Errorf("%s: %w", failPrefix, err), w)
+		}
+	}
+
+	installSmartSDRWindowsBtn := widget.NewButton("Windows SmartSDR (W4CAR)", nil)
+	installSmartSDRWindowsBtn.OnTapped = func() {
+		if runtime.GOOS != "windows" {
+			dialog.ShowInformation("SmartSDR", "Windows SmartSDR install is only available on Windows.", w)
+			return
+		}
+
+		installSmartSDRWindowsBtn.Disable()
+		installSmartSDRWindowsBtn.SetText("Checking W4CAR...")
+		smartInstallLabel.SetText("SmartSDR Install: checking W4CAR target version...")
+
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), updateCheckTimeout)
+			defer cancel()
+
+			targetVersion, err := fetchW4CARSmartSDRTargetVersion(ctx)
+			if err != nil {
+				fyne.Do(func() {
+					installSmartSDRWindowsBtn.SetText("Windows SmartSDR (W4CAR)")
+					installSmartSDRWindowsBtn.Enable()
+					smartInstallLabel.SetText("SmartSDR Install: failed to read W4CAR target version")
+					dialog.ShowError(fmt.Errorf("W4CAR SmartSDR version check failed: %w", err), w)
+				})
+				return
+			}
+
+			currentVersion, curErr := getSmartSDRVersion()
+			if curErr != nil {
+				currentVersion = "not detected"
+			}
+			targetNorm := normalizeVersion3(targetVersion)
+			currentNorm := normalizeVersion3(currentVersion)
+
+			fyne.Do(func() {
+				smartInstallLabel.SetText(fmt.Sprintf("SmartSDR Install: W4CAR target version is %s", targetVersion))
+				if targetNorm != "" && currentNorm != "" && targetNorm == currentNorm {
+					dialog.ShowInformation(
+						"Install/Update SmartSDR",
+						fmt.Sprintf("Installed SmartSDR (%s) already matches W4CAR target (%s).", currentNorm, targetNorm),
+						w,
+					)
+					installSmartSDRWindowsBtn.SetText("Windows SmartSDR (W4CAR)")
+					installSmartSDRWindowsBtn.Enable()
+					return
+				}
+				dialog.ShowConfirm(
+					"Install/Update SmartSDR",
+					fmt.Sprintf("W4CAR target version: %s\nInstalled: %s\n\nUsing comparison: %s vs %s\n\nInstall/update now from smartsdr.flexradio.com?",
+						targetVersion, currentVersion,
+						func() string {
+							if targetNorm == "" {
+								return "n/a"
+							}
+							return targetNorm
+						}(),
+						func() string {
+							if currentNorm == "" {
+								return "n/a"
+							}
+							return currentNorm
+						}(),
+					),
+					func(doInstall bool) {
+						if !doInstall {
+							installSmartSDRWindowsBtn.SetText("Windows SmartSDR (W4CAR)")
+							installSmartSDRWindowsBtn.Enable()
+							return
+						}
+
+						installSmartSDRWindowsBtn.Disable()
+						installSmartSDRWindowsBtn.SetText("Installing...")
+						go func() {
+							output, installErr := installSmartSDRWindowsVersion(targetVersion)
+							fyne.Do(func() {
+								installSmartSDRWindowsBtn.SetText("Windows SmartSDR (W4CAR)")
+								installSmartSDRWindowsBtn.Enable()
+								if installErr != nil {
+									log.Printf("SmartSDR install failed: %v\n%s", installErr, output)
+									dialog.ShowInformation(
+										"SmartSDR Install",
+										"Automatic install failed. Opening W4CAR page for manual install.",
+										w,
+									)
+									openURL(smartSDRWindowsURL(), "Unable to open W4CAR SmartSDR page")
+									return
+								}
+								log.Printf("SmartSDR install output:\n%s", output)
+								dialog.ShowInformation("SmartSDR Install", "SmartSDR install/update command completed.", w)
+							})
+						}()
+					},
+					w,
+				)
+			})
+		}()
+	}
+	installSmartSDRPaidBtn := widget.NewButton("Paid SmartSDR (App Store)", func() {
+		openURL(smartSDRPaidMacURL, "Unable to open SmartSDR App Store page")
+	})
+	installSmartSDRFreeBtn := widget.NewButton("Free AetherSDR (GitHub)", func() {
+		openURL(aetherSDRRepoURL, "Unable to open AetherSDR page")
+	})
+	smartInstallDetail := widget.NewLabel("")
+	switch runtime.GOOS {
+	case "windows":
+		smartInstallDetail.SetText("Windows: button checks W4CAR SmartSDR target version, then installs/updates from smartsdr.flexradio.com.")
+	case "darwin":
+		smartInstallDetail.SetText("macOS: choose Paid SmartSDR in App Store or Free AetherSDR.")
+	default:
+		smartInstallDetail.SetText("Linux: use Free AetherSDR. (Paid SmartSDR App Store page is macOS-only.)")
+	}
 
 	firewallLabel := widget.NewLabel("Firewall: checking...")
 	firewallFixBtn := widget.NewButton("Fix Firewall Rule", nil)
@@ -646,11 +1023,85 @@ func Run() {
 
 	aboutHeader := widget.NewLabelWithStyle("About", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 
+	runUpdateCheck := func(manual bool) {
+		currentVersion := buildinfo.Short()
+		updateLabel.SetText("Update: checking...")
+		checkUpdateBtn.Disable()
+
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), updateCheckTimeout)
+			defer cancel()
+
+			latestTag, releaseURL, err := fetchLatestRelease(ctx)
+			fyne.Do(func() {
+				defer checkUpdateBtn.Enable()
+
+				if err != nil {
+					log.Printf("About: update check failed: %v", err)
+					updateLabel.SetText("Update: check failed")
+					if manual {
+						dialog.ShowInformation("Update Check", "Unable to check for updates right now.", w)
+					}
+					return
+				}
+
+				latestReleaseURL = releaseURL
+				openReleaseBtn.Enable()
+
+				cmp, cmpErr := compareVersions(currentVersion, latestTag)
+				if cmpErr != nil {
+					log.Printf("About: version compare failed current=%s latest=%s err=%v", currentVersion, latestTag, cmpErr)
+					updateLabel.SetText("Update: latest " + latestTag + " (comparison unavailable)")
+					if manual {
+						dialog.ShowInformation("Update Check", fmt.Sprintf("Latest release is %s.", latestTag), w)
+					}
+					return
+				}
+
+				if cmp < 0 {
+					updateLabel.SetText(fmt.Sprintf("Update: %s available (current %s)", latestTag, currentVersion))
+					dialog.ShowConfirm(
+						"Update Available",
+						fmt.Sprintf("A new version (%s) is available.\nOpen releases page now?", latestTag),
+						func(open bool) {
+							if !open {
+								return
+							}
+							u, err := url.Parse(releaseURL)
+							if err != nil {
+								dialog.ShowError(fmt.Errorf("invalid release URL: %w", err), w)
+								return
+							}
+							if err := a.OpenURL(u); err != nil {
+								dialog.ShowError(fmt.Errorf("unable to open release URL: %w", err), w)
+							}
+						},
+						w,
+					)
+					return
+				}
+
+				updateLabel.SetText(fmt.Sprintf("Update: up to date (%s)", currentVersion))
+				if manual {
+					dialog.ShowInformation("Update Check", "You are on the latest version.", w)
+				}
+			})
+		}()
+	}
+	checkUpdateBtn.OnTapped = func() {
+		runUpdateCheck(true)
+	}
+
 	aboutPage := container.NewVBox(
 		aboutHeader,
 		appVersionLabel,
 		netbirdVersionLabel,
 		smartSDRLabel,
+		smartInstallLabel,
+		container.NewHBox(installSmartSDRWindowsBtn, installSmartSDRPaidBtn, installSmartSDRFreeBtn),
+		smartInstallDetail,
+		updateLabel,
+		container.NewHBox(checkUpdateBtn, openReleaseBtn),
 		firewallLabel,
 		firewallFixBtn,
 		widget.NewSeparator(),
@@ -1328,6 +1779,14 @@ func Run() {
 	go func() {
 		time.Sleep(200 * time.Millisecond)
 		fyne.Do(refreshFirewallStatus)
+	}()
+
+	// Startup update check (non-blocking) shortly after launch.
+	go func() {
+		time.Sleep(1500 * time.Millisecond)
+		fyne.Do(func() {
+			runUpdateCheck(false)
+		})
 	}()
 
 	w.ShowAndRun()
