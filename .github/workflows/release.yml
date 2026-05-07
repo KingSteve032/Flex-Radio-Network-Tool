@@ -113,7 +113,7 @@ jobs:
           githubToken: ${{ github.token }}
           install: |
             apt-get update -y
-            apt-get install -y build-essential libpcap-dev ca-certificates curl
+            apt-get install -y build-essential clang libpcap-dev ca-certificates curl
           run: |
             set -euo pipefail
             mkdir -p dist
@@ -147,6 +147,12 @@ jobs:
             if [ "${{ matrix.goarch }}" = "arm" ]; then
               export GOARM="${{ matrix.goarm }}"
             fi
+            # Avoid GCC ICEs seen under QEMU emulation for CGO deps (sqlite/pcap).
+            export CC=clang
+            export CXX=clang++
+            export CGO_CFLAGS="-O1"
+            export CGO_CXXFLAGS="-O1"
+            export GOFLAGS="-p=1"
 
             go build -trimpath -ldflags "${LDFLAGS}" -o "dist/frnt-linux-${{ matrix.arch_label }}" .
 
