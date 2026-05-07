@@ -70,6 +70,9 @@ jobs:
             "-X github.com/KingSteve032/Flex-Radio-Network-Tool/internal/buildinfo.Commit=$commit"
             "-X github.com/KingSteve032/Flex-Radio-Network-Tool/internal/buildinfo.BuildDate=$date"
           ) -join " "
+          if ("${{ matrix.goos }}" -eq "windows") {
+            $ldflags += " -H=windowsgui"
+          }
 
           $env:GOOS = "${{ matrix.goos }}"
           $env:GOARCH = "${{ matrix.goarch }}"
