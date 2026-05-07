@@ -2,6 +2,7 @@ package frnt
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"os"
@@ -14,11 +15,16 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+const sudoPasswordB64Token = "__FRNT_SUDO_PASSWORD_B64__"
+
 type adminTarget struct {
 	User    string
 	Host    string
 	Port    int
 	Display string
+	// Optional per-target credentials. When blank, request-level defaults are used.
+	SSHPassword  string
+	SudoPassword string
 }
 
 type adminFlexToolConfig struct {
@@ -53,6 +59,23 @@ type adminBatchRequest struct {
 	CommandTimeout time.Duration
 }
 
+func (r adminBatchRequest) sshPasswordFor(target adminTarget) string {
+	if strings.TrimSpace(target.SSHPassword) != "" {
+		return target.SSHPassword
+	}
+	return r.SSHPassword
+}
+
+func (r adminBatchRequest) sudoPasswordForTarget(target adminTarget) string {
+	if strings.TrimSpace(target.SudoPassword) != "" {
+		return target.SudoPassword
+	}
+	if strings.TrimSpace(r.SudoPassword) != "" {
+		return r.SudoPassword
+	}
+	return r.sshPasswordFor(target)
+}
+
 func parseAdminTargets(raw, defaultUser string) ([]adminTarget, error) {
 	defaultUser = strings.TrimSpace(defaultUser)
 	if defaultUser == "" {
@@ -67,11 +90,29 @@ func parseAdminTargets(raw, defaultUser string) ([]adminTarget, error) {
 			continue
 		}
 
+		// Optional inline credential format:
+		//   user@host[:port]
+		//   user@host[:port] ssh_password
+		//   user@host[:port] ssh_password sudo_password
+		parts := strings.Fields(line)
+		if len(parts) == 0 {
+			continue
+		}
+		endpoint := parts[0]
+		targetSSHPassword := ""
+		targetSudoPassword := ""
+		if len(parts) >= 2 {
+			targetSSHPassword = parts[1]
+		}
+		if len(parts) >= 3 {
+			targetSudoPassword = parts[2]
+		}
+
 		userPart := defaultUser
-		hostPart := line
-		if at := strings.LastIndex(line, "@"); at > 0 {
-			userPart = strings.TrimSpace(line[:at])
-			hostPart = strings.TrimSpace(line[at+1:])
+		hostPart := endpoint
+		if at := strings.LastIndex(endpoint, "@"); at > 0 {
+			userPart = strings.TrimSpace(endpoint[:at])
+			hostPart = strings.TrimSpace(endpoint[at+1:])
 		}
 		if userPart == "" || hostPart == "" {
 			return nil, fmt.Errorf("line %d: expected [user@]host[:port]", i+1)
@@ -83,10 +124,12 @@ func parseAdminTargets(raw, defaultUser string) ([]adminTarget, error) {
 		}
 
 		out = append(out, adminTarget{
-			User:    userPart,
-			Host:    host,
-			Port:    port,
-			Display: fmt.Sprintf("%s@%s:%d", userPart, host, port),
+			User:         userPart,
+			Host:         host,
+			Port:         port,
+			Display:      fmt.Sprintf("%s@%s:%d", userPart, host, port),
+			SSHPassword:  targetSSHPassword,
+			SudoPassword: targetSudoPassword,
 		})
 	}
 
@@ -289,6 +332,193 @@ func buildAutoBootstrapCommand(repoURL, sourceDir, buildOutput, installPath, sud
 	return strings.Join(lines, "\n")
 }
 
+func buildGitHubReleaseInstallCommand(repoFullName, installPath string) string {
+	repoFullName = strings.TrimSpace(repoFullName)
+	if repoFullName == "" {
+		repoFullName = "KingSteve032/Flex-Radio-Network-Tool"
+	}
+	installPath = strings.TrimSpace(installPath)
+	if installPath == "" {
+		installPath = "/usr/local/bin/frnt"
+	}
+
+	lines := []string{
+		"set -e",
+		"arch=\"$(uname -m)\"",
+		"asset=\"\"",
+		"case \"$arch\" in",
+		"  x86_64|amd64) asset=\"frnt-linux-amd64\" ;;",
+		"  aarch64|arm64) asset=\"frnt-linux-arm64\" ;;",
+		"  armv7l|armv7|armhf) asset=\"frnt-linux-armv7\" ;;",
+		"  *) echo \"Unsupported architecture: $arch\" >&2; exit 1 ;;",
+		"esac",
+		"url=\"https://github.com/" + repoFullName + "/releases/latest/download/${asset}\"",
+		"tmp=\"$(mktemp /tmp/frnt-release.XXXXXX)\"",
+		"trap 'rm -f \"$tmp\"' EXIT",
+		"curl -fL --retry 3 --connect-timeout 10 -o \"$tmp\" \"$url\"",
+		"chmod +x \"$tmp\"",
+		"if sudo -n true >/dev/null 2>&1; then",
+		"  sudo -n install -m 0755 \"$tmp\" " + shQuote(installPath),
+		"elif [ -n \"" + sudoPasswordB64Token + "\" ]; then",
+		"  printf '%s' \"" + sudoPasswordB64Token + "\" | base64 -d | sudo -S -p '' install -m 0755 \"$tmp\" " + shQuote(installPath),
+		"else",
+		"  echo \"sudo password is required for install\" >&2",
+		"  exit 1",
+		"fi",
+	}
+	return strings.Join(lines, "\n")
+}
+
+func applyTargetSudoPasswordToken(command, sudoPassword string) string {
+	if !strings.Contains(command, sudoPasswordB64Token) {
+		return command
+	}
+	if strings.TrimSpace(sudoPassword) == "" {
+		return strings.ReplaceAll(command, sudoPasswordB64Token, "")
+	}
+	enc := base64.StdEncoding.EncodeToString([]byte(sudoPassword))
+	return strings.ReplaceAll(command, sudoPasswordB64Token, enc)
+}
+
+func buildServerInfoCommand(serviceName, binaryPath string) string {
+	serviceName = strings.TrimSpace(serviceName)
+	if serviceName == "" {
+		serviceName = "frnt-listen.service"
+	}
+	binaryPath = strings.TrimSpace(binaryPath)
+	if binaryPath == "" {
+		binaryPath = "/usr/local/bin/frnt"
+	}
+	binaryDir := path.Dir(binaryPath)
+	configA := "$HOME/.flextool"
+	configB := binaryDir + "/.flextool"
+
+	lines := []string{
+		"set -e",
+		"echo \"HOST=$(hostname)\"",
+		"echo \"KERNEL=$(uname -srmo)\"",
+		"echo \"UPTIME=$(uptime -p || true)\"",
+		"echo \"IP_ADDRS_BEGIN\"",
+		"ip -4 -brief addr || true",
+		"echo \"IP_ADDRS_END\"",
+		"echo \"FRNT_VERSION_BEGIN\"",
+		"if [ -x " + shQuote(binaryPath) + " ]; then " + shQuote(binaryPath) + " --version || true; else echo \"missing: " + binaryPath + "\"; fi",
+		"echo \"FRNT_VERSION_END\"",
+		"echo \"SERVICE_STATUS_BEGIN\"",
+		"systemctl is-enabled " + shQuote(serviceName) + " || true",
+		"systemctl is-active " + shQuote(serviceName) + " || true",
+		"systemctl --no-pager -l status " + shQuote(serviceName) + " | sed -n '1,18p' || true",
+		"echo \"SERVICE_STATUS_END\"",
+		"echo \"CONFIG_PATHS_BEGIN\"",
+		"for p in " + configA + " " + shQuote(configB) + "; do if [ -f \"$p\" ]; then echo \"$p\"; fi; done",
+		"echo \"CONFIG_PATHS_END\"",
+	}
+	return strings.Join(lines, "\n")
+}
+
+func buildFetchConfigCommand(binaryPath string) string {
+	binaryPath = strings.TrimSpace(binaryPath)
+	if binaryPath == "" {
+		binaryPath = "/usr/local/bin/frnt"
+	}
+	binaryDir := path.Dir(binaryPath)
+	lines := []string{
+		"set -e",
+		"echo \"__FRNT_CONFIG_BEGIN__\"",
+		"if [ -f \"$HOME/.flextool\" ]; then",
+		"  cat \"$HOME/.flextool\"",
+		"elif [ -f " + shQuote(binaryDir+"/.flextool") + " ]; then",
+		"  cat " + shQuote(binaryDir+"/.flextool"),
+		"else",
+		"  echo \"# .flextool not found\"",
+		"fi",
+		"echo \"__FRNT_CONFIG_END__\"",
+	}
+	return strings.Join(lines, "\n")
+}
+
+func buildRebootCommand(sudoPassword string) string {
+	return strings.Join([]string{
+		"set -e",
+		"echo \"Rebooting...\"",
+		sudoWrap("systemctl reboot", sudoPassword),
+	}, "\n")
+}
+
+func extractMarkedBlock(text, beginMarker, endMarker string) string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	start := strings.Index(text, beginMarker)
+	if start < 0 {
+		return ""
+	}
+	start += len(beginMarker)
+	if start < len(text) && text[start] == '\n' {
+		start++
+	}
+	rest := text[start:]
+	end := strings.Index(rest, endMarker)
+	if end < 0 {
+		return strings.TrimSpace(rest)
+	}
+	return strings.TrimSpace(rest[:end])
+}
+
+func parseFlexToolConfig(content string, base adminFlexToolConfig) adminFlexToolConfig {
+	cfg := base
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	lines := strings.Split(content, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		kv := strings.SplitN(line, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(kv[0])
+		val := strings.TrimSpace(kv[1])
+		val = strings.Trim(val, `"`)
+		switch key {
+		case "BROADCAST":
+			cfg.Broadcast = strings.EqualFold(val, "true")
+		case "LISTEN_INTERFACE":
+			cfg.ListenInterface = val
+		case "SEND_INTERFACE":
+			cfg.SendInterface = val
+		case "DEBUG":
+			cfg.Debug = strings.EqualFold(val, "true")
+		case "NETBIRD_API_TOKEN":
+			cfg.NetBirdAPIToken = val
+		case "NETBIRD_API_URL":
+			cfg.NetBirdAPIURL = val
+		case "DISCOVERY_DELAY_SECONDS":
+			if n, err := strconv.Atoi(val); err == nil && n >= 0 {
+				cfg.DiscoveryDelaySeconds = n
+			}
+		case "SYNC_INTERVAL_SECONDS":
+			if n, err := strconv.Atoi(val); err == nil && n >= 0 {
+				cfg.SyncIntervalSeconds = n
+			}
+		case "IGNORE_RADIOS":
+			cfg.IgnoreRadios = val
+		case "ENABLE_VITA_PROXY":
+			cfg.EnableVitaProxy = strings.EqualFold(val, "true")
+		case "VITA_PROXY_PORT":
+			if n, err := strconv.Atoi(val); err == nil && n > 0 {
+				cfg.VitaProxyPort = n
+			}
+		case "PROXY_BASE_PORT":
+			if n, err := strconv.Atoi(val); err == nil && n > 0 {
+				cfg.ProxyBasePort = n
+			}
+		case "MULTI_PROXY":
+			cfg.MultiProxy = strings.EqualFold(val, "true")
+		}
+	}
+	return cfg
+}
+
 func sudoWrap(inner, sudoPassword string) string {
 	if strings.TrimSpace(sudoPassword) == "" {
 		return "sudo -n sh -lc " + shQuote(inner)
@@ -316,8 +546,12 @@ func runAdminBatch(req adminBatchRequest, logf func(string)) (okCount, failCount
 
 	for _, t := range targets {
 		logf(fmt.Sprintf("[%s] starting batch actions", t.Display))
+		sshPassword := req.sshPasswordFor(t)
+		sudoPassword := req.sudoPasswordForTarget(t)
+
 		if req.RunInstallCmd && strings.TrimSpace(req.InstallCommand) != "" {
-			out, err := runSSHCommand(t, req.SSHPassword, req.InstallCommand, req.ConnectTimeout, req.CommandTimeout)
+			installCommand := applyTargetSudoPasswordToken(req.InstallCommand, sudoPassword)
+			out, err := runSSHCommand(t, sshPassword, installCommand, req.ConnectTimeout, req.CommandTimeout)
 			if out != "" {
 				logf(fmt.Sprintf("[%s] install output:\n%s", t.Display, out))
 			}
@@ -331,7 +565,7 @@ func runAdminBatch(req adminBatchRequest, logf func(string)) (okCount, failCount
 
 		if req.ApplyConfig {
 			cmd := buildConfigApplyCommand(req.FlexToolConfig)
-			out, err := runSSHCommand(t, req.SSHPassword, cmd, req.ConnectTimeout, req.CommandTimeout)
+			out, err := runSSHCommand(t, sshPassword, cmd, req.ConnectTimeout, req.CommandTimeout)
 			if out != "" {
 				logf(fmt.Sprintf("[%s] config output:\n%s", t.Display, out))
 			}
@@ -344,8 +578,8 @@ func runAdminBatch(req adminBatchRequest, logf func(string)) (okCount, failCount
 		}
 
 		if req.InstallService {
-			cmd := buildInstallServiceCommand(req.ServiceName, req.BinaryPath, req.SudoPasswordOrDefault())
-			out, err := runSSHCommand(t, req.SSHPassword, cmd, req.ConnectTimeout, req.CommandTimeout)
+			cmd := buildInstallServiceCommand(req.ServiceName, req.BinaryPath, sudoPassword)
+			out, err := runSSHCommand(t, sshPassword, cmd, req.ConnectTimeout, req.CommandTimeout)
 			if out != "" {
 				logf(fmt.Sprintf("[%s] service install output:\n%s", t.Display, out))
 			}
@@ -358,8 +592,8 @@ func runAdminBatch(req adminBatchRequest, logf func(string)) (okCount, failCount
 		}
 
 		if req.RestartService {
-			cmd := buildRestartServiceCommand(req.ServiceName, req.SudoPasswordOrDefault())
-			out, err := runSSHCommand(t, req.SSHPassword, cmd, req.ConnectTimeout, req.CommandTimeout)
+			cmd := buildRestartServiceCommand(req.ServiceName, sudoPassword)
+			out, err := runSSHCommand(t, sshPassword, cmd, req.ConnectTimeout, req.CommandTimeout)
 			if out != "" {
 				logf(fmt.Sprintf("[%s] restart output:\n%s", t.Display, out))
 			}
@@ -382,6 +616,108 @@ func (r adminBatchRequest) SudoPasswordOrDefault() string {
 		return r.SudoPassword
 	}
 	return r.SSHPassword
+}
+
+func runAdminCommandOnTargets(req adminBatchRequest, command string, logf func(string)) (okCount, failCount int) {
+	if req.ConnectTimeout <= 0 {
+		req.ConnectTimeout = 10 * time.Second
+	}
+	if req.CommandTimeout <= 0 {
+		req.CommandTimeout = 2 * time.Minute
+	}
+
+	targets := make([]adminTarget, len(req.Targets))
+	copy(targets, req.Targets)
+	sort.Slice(targets, func(i, j int) bool {
+		return targets[i].Display < targets[j].Display
+	})
+
+	for _, t := range targets {
+		logf(fmt.Sprintf("[%s] running command...", t.Display))
+		out, err := runSSHCommand(t, req.sshPasswordFor(t), command, req.ConnectTimeout, req.CommandTimeout)
+		if out != "" {
+			logf(fmt.Sprintf("[%s] output:\n%s", t.Display, out))
+		}
+		if err != nil {
+			logf(fmt.Sprintf("[%s] command failed: %v", t.Display, err))
+			failCount++
+			continue
+		}
+		okCount++
+	}
+	return okCount, failCount
+}
+
+func rebootTargetsAndWait(req adminBatchRequest, serviceName string, logf func(string)) (okCount, failCount int) {
+	if req.ConnectTimeout <= 0 {
+		req.ConnectTimeout = 10 * time.Second
+	}
+	if req.CommandTimeout <= 0 {
+		req.CommandTimeout = 2 * time.Minute
+	}
+	serviceName = strings.TrimSpace(serviceName)
+	if serviceName == "" {
+		serviceName = "frnt-listen.service"
+	}
+
+	targets := make([]adminTarget, len(req.Targets))
+	copy(targets, req.Targets)
+	sort.Slice(targets, func(i, j int) bool {
+		return targets[i].Display < targets[j].Display
+	})
+
+	for _, t := range targets {
+		sshPassword := req.sshPasswordFor(t)
+		sudoPassword := req.sudoPasswordForTarget(t)
+
+		logf(fmt.Sprintf("[%s] sending reboot command...", t.Display))
+		_, _ = runSSHCommand(t, sshPassword, buildRebootCommand(sudoPassword), req.ConnectTimeout, 20*time.Second)
+
+		deadline := time.Now().Add(4 * time.Minute)
+		seenOffline := false
+		seenOnline := false
+		lastErr := ""
+
+		for time.Now().Before(deadline) {
+			_, err := runSSHCommand(t, sshPassword, "echo up", 5*time.Second, 10*time.Second)
+			if err != nil {
+				seenOffline = true
+				lastErr = err.Error()
+				time.Sleep(5 * time.Second)
+				continue
+			}
+			seenOnline = true
+			if !seenOffline {
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			break
+		}
+
+		if !seenOnline {
+			logf(fmt.Sprintf("[%s] reboot wait failed: host did not come back online (%s)", t.Display, lastErr))
+			failCount++
+			continue
+		}
+
+		checkCmd := strings.Join([]string{
+			"set -e",
+			"systemctl is-active " + shQuote(serviceName) + " || true",
+			"systemctl --no-pager -l status " + shQuote(serviceName) + " | sed -n '1,12p' || true",
+		}, "\n")
+		out, err := runSSHCommand(t, sshPassword, checkCmd, req.ConnectTimeout, 30*time.Second)
+		if out != "" {
+			logf(fmt.Sprintf("[%s] post-reboot service check:\n%s", t.Display, out))
+		}
+		if err != nil {
+			logf(fmt.Sprintf("[%s] post-reboot service check failed: %v", t.Display, err))
+			failCount++
+			continue
+		}
+		logf(fmt.Sprintf("[%s] reboot complete and service check ran", t.Display))
+		okCount++
+	}
+	return okCount, failCount
 }
 
 func runSSHCommand(target adminTarget, password, command string, connectTimeout, cmdTimeout time.Duration) (string, error) {

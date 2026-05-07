@@ -154,20 +154,106 @@ jobs:
           path: dist/frnt-linux-${{ matrix.arch_label }}
           if-no-files-found: error
 
+  package-windows-installer:
+    name: Build Windows Installer
+    runs-on: windows-latest
+    needs: [build-native]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download windows binary
+        uses: actions/download-artifact@v4
+        with:
+          name: frnt-windows-amd64
+          path: dist/raw
+
+      - name: Install packaging tools
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          choco install imagemagick.tool -y --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $src = Get-ChildItem -Path dist/raw -Recurse -File | Where-Object { $_.Name -eq "frnt-windows-amd64.exe" } | Select-Object -First 1
+          if (-not $src) { throw "Could not find frnt-windows-amd64.exe in downloaded artifacts" }
+          Copy-Item $src.FullName dist/frnt-windows-amd64.exe -Force
+          $version = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "dev" }
+          ./scripts/build-windows-installer.ps1 -Version $version -InputExe "dist/frnt-windows-amd64.exe" -OutputDir "dist/installer"
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frnt-windows-amd64-installer
+          path: dist/installer/*.exe
+          if-no-files-found: error
+
+  package-macos-installer:
+    name: Build macOS Installer
+    runs-on: macos-latest
+    needs: [build-native]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download darwin amd64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: frnt-darwin-amd64
+          path: dist/raw/amd64
+
+      - name: Download darwin arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: frnt-darwin-arm64
+          path: dist/raw/arm64
+
+      - name: Build universal binary and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          AMD64_BIN="$(find dist/raw/amd64 -type f -name 'frnt-darwin-amd64' | head -n 1)"
+          ARM64_BIN="$(find dist/raw/arm64 -type f -name 'frnt-darwin-arm64' | head -n 1)"
+          if [[ -z "${AMD64_BIN}" || -z "${ARM64_BIN}" ]]; then
+            echo "Missing darwin binaries for packaging" >&2
+            exit 1
+          fi
+          lipo -create -output dist/frnt-darwin-universal "${AMD64_BIN}" "${ARM64_BIN}"
+          chmod +x dist/frnt-darwin-universal
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          bash scripts/build-macos-installer.sh "${VERSION}" dist/frnt-darwin-universal dist/installer
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frnt-macos-universal-installer
+          path: dist/installer/*.pkg
+          if-no-files-found: error
+
   release:
     name: Create GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    needs: [build-native, build-linux-arm]
+    needs: [build-native, build-linux-arm, package-windows-installer, package-macos-installer]
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
 
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          find dist -type f -print0 | sort -z | xargs -0 sha256sum > dist/SHA256SUMS.txt
+
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/**/*
+            dist/SHA256SUMS.txt
           generate_release_notes: true

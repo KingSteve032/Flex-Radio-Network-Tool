@@ -129,8 +129,12 @@ What it does:
   - Linux `armv7` (Raspberry Pi 3/4 32-bit OS)
   - Windows `amd64`
   - macOS `amd64` and `arm64`
+- Builds GUI installers:
+  - Windows installer (`frnt-windows-amd64-setup-<version>.exe`)
+  - macOS universal installer (`frnt-macos-universal-installer-<version>.pkg`)
 - Uploads artifacts for every run.
 - On tag push `v*`, creates a GitHub Release and attaches the binaries.
+- Publishes `SHA256SUMS.txt` for release asset verification.
 
 How to publish:
 1. Update `internal/buildinfo/buildinfo.go` (if needed for local default version).
@@ -172,3 +176,24 @@ To keep client updates in the same location every time:
 - macOS (installs to `/Applications/Flex Radio Network Tool/frnt`):
   - `bash scripts/install-client-macos.sh`
   - Specific release: `bash scripts/install-client-macos.sh v0.2.6`
+
+## Native GUI Installers
+
+Release workflow also publishes OS-native client installers:
+
+- Windows: `frnt-windows-amd64-setup-<version>.exe`
+  - Default path: `C:\Program Files\Flex Radio Network Tool`
+  - Optional installer tasks:
+    - Start Menu shortcut
+    - Desktop shortcut
+- macOS: `frnt-macos-universal-installer-<version>.pkg`
+  - Installs app bundle to `/Applications/Flex Radio Network Tool.app`
+
+Both installers ship `icon.png` with the app and use converted platform icon assets derived from `assets/icon.png`.
+
+Manual local packaging helpers:
+
+- Windows installer:
+  - `powershell -ExecutionPolicy Bypass -File scripts/build-windows-installer.ps1 -Version v0.2.8 -InputExe dist/frnt-windows-amd64.exe`
+- macOS installer:
+  - `bash scripts/build-macos-installer.sh v0.2.8 dist/frnt-darwin-universal dist/installer`

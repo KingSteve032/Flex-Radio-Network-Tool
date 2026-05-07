@@ -706,26 +706,39 @@ func Run() {
 	}
 
 	adminHeader := widget.NewLabelWithStyle("Admin (Hidden)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-	adminHint := widget.NewLabel("Batch tools for Flextool servers. Use carefully.")
+	adminHint := widget.NewLabel("Install from GitHub release, pull/edit/repush .flextool, restart service, and reboot hosts with service checks.")
 	adminStatus := widget.NewLabel("Idle.")
 	adminStatus.Wrapping = fyne.TextWrapWord
 
-	adminServersEntry := widget.NewMultiLineEntry()
-	adminServersEntry.SetPlaceHolder("one per line:\nuser@10.2.0.164\nuser@10.10.1.50:22")
-	adminServersEntry.SetMinRowsVisible(7)
+	adminTargetsEntry := widget.NewMultiLineEntry()
+	adminTargetsEntry.SetPlaceHolder("one per line: user@host[:port] [ssh_password] [sudo_password]\nw4car@10.2.0.4 Chesapeake1!\nroot@10.10.1.50:22 sshpass sudopass")
+	adminTargetsEntry.SetMinRowsVisible(6)
 
 	adminDefaultUser := widget.NewEntry()
 	adminDefaultUser.SetText("root")
 
-	adminSSHPassword := widget.NewPasswordEntry()
-	adminSSHPassword.SetPlaceHolder("SSH password (optional if keys are available)")
+	adminSSHPassword := widget.NewEntry()
+	adminSSHPassword.SetPlaceHolder("default SSH password (optional)")
 
-	adminSudoPassword := widget.NewPasswordEntry()
-	adminSudoPassword.SetPlaceHolder("Sudo password (blank = same as SSH password)")
+	adminSudoPassword := widget.NewEntry()
+	adminSudoPassword.SetPlaceHolder("default sudo password (blank = SSH password)")
 
-	adminInstallCommand := widget.NewMultiLineEntry()
-	adminInstallCommand.SetPlaceHolder("Optional mass install/build command.\nExample:\ncd /home/testbed/frnt-smoke/src && go build -o /home/testbed/frnt-smoke/frnt .")
-	adminInstallCommand.SetMinRowsVisible(4)
+	adminQuickUser := widget.NewEntry()
+	adminQuickUser.SetPlaceHolder("user")
+	adminQuickUser.SetText("w4car")
+
+	adminQuickHost := widget.NewEntry()
+	adminQuickHost.SetPlaceHolder("host or IP")
+
+	adminQuickPort := widget.NewEntry()
+	adminQuickPort.SetPlaceHolder("22")
+	adminQuickPort.SetText("22")
+
+	adminQuickSSH := widget.NewEntry()
+	adminQuickSSH.SetPlaceHolder("ssh password")
+
+	adminQuickSudo := widget.NewEntry()
+	adminQuickSudo.SetPlaceHolder("sudo password")
 
 	adminServiceName := widget.NewEntry()
 	adminServiceName.SetText("frnt-listen.service")
@@ -733,14 +746,8 @@ func Run() {
 	adminBinaryPath := widget.NewEntry()
 	adminBinaryPath.SetText("/usr/local/bin/frnt")
 
-	adminRepoURL := widget.NewEntry()
-	adminRepoURL.SetText("https://github.com/KingSteve032/Flex-Radio-Network-Tool.git")
-
-	adminSourceDir := widget.NewEntry()
-	adminSourceDir.SetText("/opt/frnt/src")
-
-	adminBuildOutput := widget.NewEntry()
-	adminBuildOutput.SetText("/opt/frnt/frnt")
+	adminReleaseRepo := widget.NewEntry()
+	adminReleaseRepo.SetText("KingSteve032/Flex-Radio-Network-Tool")
 
 	adminBroadcast := widget.NewCheck("", nil)
 	adminBroadcast.SetChecked(true)
@@ -782,16 +789,21 @@ func Run() {
 	adminMultiProxy.SetChecked(true)
 
 	adminLog := widget.NewMultiLineEntry()
-	adminLog.SetMinRowsVisible(12)
-	adminLog.SetPlaceHolder("Batch output will appear here...")
+	adminLog.SetMinRowsVisible(22)
+	adminLog.SetPlaceHolder("Admin log output will appear here...")
 
 	appendAdminLog := func(line string) {
 		fyne.Do(func() {
 			ts := time.Now().Format("15:04:05")
+			line = strings.TrimSpace(line)
+			if line == "" {
+				return
+			}
+			prefixed := "[" + ts + "] " + line
 			if strings.TrimSpace(adminLog.Text) == "" {
-				adminLog.SetText("[" + ts + "] " + line)
+				adminLog.SetText(prefixed)
 			} else {
-				adminLog.SetText(adminLog.Text + "\n[" + ts + "] " + line)
+				adminLog.SetText(adminLog.Text + "\n" + prefixed)
 			}
 		})
 	}
@@ -804,124 +816,269 @@ func Run() {
 		return v, nil
 	}
 
-	runAdminAction := func(applyConfig, runInstall, installService, restartService bool, installCommandOverride string) {
-		targets, err := parseAdminTargets(adminServersEntry.Text, adminDefaultUser.Text)
-		if err != nil {
-			dialog.ShowError(err, w)
-			adminStatus.SetText("Input error: " + err.Error())
-			return
-		}
-
+	loadConfigFromForm := func() (adminFlexToolConfig, error) {
 		discoveryDelay, err := parsePositiveIntField("Discovery Delay", adminDiscoveryDelay.Text)
 		if err != nil {
-			dialog.ShowError(err, w)
-			adminStatus.SetText("Input error: " + err.Error())
-			return
+			return adminFlexToolConfig{}, err
 		}
 		syncInterval, err := parsePositiveIntField("Sync Interval", adminSyncInterval.Text)
 		if err != nil {
-			dialog.ShowError(err, w)
-			adminStatus.SetText("Input error: " + err.Error())
-			return
+			return adminFlexToolConfig{}, err
 		}
 		vitaPort, err := parsePositiveIntField("VITA Proxy Port", adminVitaPort.Text)
 		if err != nil {
-			dialog.ShowError(err, w)
-			adminStatus.SetText("Input error: " + err.Error())
-			return
+			return adminFlexToolConfig{}, err
 		}
 		proxyBase, err := parsePositiveIntField("Proxy Base Port", adminProxyBasePort.Text)
+		if err != nil {
+			return adminFlexToolConfig{}, err
+		}
+		return adminFlexToolConfig{
+			Broadcast:             adminBroadcast.Checked,
+			ListenInterface:       strings.TrimSpace(adminListenIF.Text),
+			SendInterface:         strings.TrimSpace(adminSendIF.Text),
+			Debug:                 adminDebug.Checked,
+			NetBirdAPIToken:       strings.TrimSpace(adminAPIToken.Text),
+			NetBirdAPIURL:         strings.TrimSpace(adminAPIURL.Text),
+			DiscoveryDelaySeconds: discoveryDelay,
+			SyncIntervalSeconds:   syncInterval,
+			IgnoreRadios:          strings.TrimSpace(adminIgnoreRadios.Text),
+			EnableVitaProxy:       adminEnableVita.Checked,
+			VitaProxyPort:         vitaPort,
+			ProxyBasePort:         proxyBase,
+			MultiProxy:            adminMultiProxy.Checked,
+		}, nil
+	}
+
+	applyConfigToForm := func(cfg adminFlexToolConfig) {
+		adminBroadcast.SetChecked(cfg.Broadcast)
+		adminListenIF.SetText(cfg.ListenInterface)
+		adminSendIF.SetText(cfg.SendInterface)
+		adminDebug.SetChecked(cfg.Debug)
+		adminAPIToken.SetText(cfg.NetBirdAPIToken)
+		adminAPIURL.SetText(cfg.NetBirdAPIURL)
+		adminDiscoveryDelay.SetText(strconv.Itoa(cfg.DiscoveryDelaySeconds))
+		adminSyncInterval.SetText(strconv.Itoa(cfg.SyncIntervalSeconds))
+		adminIgnoreRadios.SetText(cfg.IgnoreRadios)
+		adminEnableVita.SetChecked(cfg.EnableVitaProxy)
+		adminVitaPort.SetText(strconv.Itoa(cfg.VitaProxyPort))
+		adminProxyBasePort.SetText(strconv.Itoa(cfg.ProxyBasePort))
+		adminMultiProxy.SetChecked(cfg.MultiProxy)
+	}
+
+	buildAdminRequest := func(applyConfig, runInstall, installService, restartService bool, installCommandOverride string) (adminBatchRequest, error) {
+		targets, err := parseAdminTargets(adminTargetsEntry.Text, adminDefaultUser.Text)
+		if err != nil {
+			return adminBatchRequest{}, err
+		}
+		cfg, err := loadConfigFromForm()
+		if err != nil {
+			return adminBatchRequest{}, err
+		}
+
+		installCommand := ""
+		if runInstall {
+			installCommand = strings.TrimSpace(installCommandOverride)
+		}
+
+		return adminBatchRequest{
+			Targets:        targets,
+			SSHPassword:    strings.TrimSpace(adminSSHPassword.Text),
+			SudoPassword:   strings.TrimSpace(adminSudoPassword.Text),
+			InstallCommand: installCommand,
+			ServiceName:    strings.TrimSpace(adminServiceName.Text),
+			BinaryPath:     strings.TrimSpace(adminBinaryPath.Text),
+			FlexToolConfig: cfg,
+			ApplyConfig:    applyConfig,
+			InstallService: installService,
+			RestartService: restartService,
+			RunInstallCmd:  runInstall && strings.TrimSpace(installCommand) != "",
+		}, nil
+	}
+
+	runAdminBatchAction := func(title string, applyConfig, runInstall, installService, restartService bool, installCommandOverride string) {
+		req, err := buildAdminRequest(applyConfig, runInstall, installService, restartService, installCommandOverride)
 		if err != nil {
 			dialog.ShowError(err, w)
 			adminStatus.SetText("Input error: " + err.Error())
 			return
 		}
 
-		installCommand := strings.TrimSpace(adminInstallCommand.Text)
-		if strings.TrimSpace(installCommandOverride) != "" {
-			installCommand = strings.TrimSpace(installCommandOverride)
-		}
-
-		req := adminBatchRequest{
-			Targets:        targets,
-			SSHPassword:    adminSSHPassword.Text,
-			SudoPassword:   adminSudoPassword.Text,
-			InstallCommand: installCommand,
-			ServiceName:    strings.TrimSpace(adminServiceName.Text),
-			BinaryPath:     strings.TrimSpace(adminBinaryPath.Text),
-			FlexToolConfig: adminFlexToolConfig{
-				Broadcast:             adminBroadcast.Checked,
-				ListenInterface:       strings.TrimSpace(adminListenIF.Text),
-				SendInterface:         strings.TrimSpace(adminSendIF.Text),
-				Debug:                 adminDebug.Checked,
-				NetBirdAPIToken:       strings.TrimSpace(adminAPIToken.Text),
-				NetBirdAPIURL:         strings.TrimSpace(adminAPIURL.Text),
-				DiscoveryDelaySeconds: discoveryDelay,
-				SyncIntervalSeconds:   syncInterval,
-				IgnoreRadios:          strings.TrimSpace(adminIgnoreRadios.Text),
-				EnableVitaProxy:       adminEnableVita.Checked,
-				VitaProxyPort:         vitaPort,
-				ProxyBasePort:         proxyBase,
-				MultiProxy:            adminMultiProxy.Checked,
-			},
-			ApplyConfig:    applyConfig,
-			InstallService: installService,
-			RestartService: restartService,
-			RunInstallCmd:  runInstall && installCommand != "",
-		}
-
-		adminStatus.SetText("Running...")
-		appendAdminLog("Starting batch run...")
+		adminStatus.SetText(title + " running...")
+		appendAdminLog(title + " started")
 		go func() {
 			okCount, failCount := runAdminBatch(req, appendAdminLog)
 			fyne.Do(func() {
-				adminStatus.SetText(fmt.Sprintf("Done. Success=%d Failed=%d", okCount, failCount))
+				adminStatus.SetText(fmt.Sprintf("%s done. Success=%d Failed=%d", title, okCount, failCount))
 			})
 		}()
 	}
 
-	adminApplyConfigBtn := widget.NewButton("Apply Config To All", func() {
-		runAdminAction(true, false, false, false, "")
-	})
-	adminInstallCmdBtn := widget.NewButton("Run Install Cmd On All", func() {
-		runAdminAction(false, true, false, false, "")
-	})
-	adminInstallSvcBtn := widget.NewButton("Install/Repair Service", func() {
-		runAdminAction(false, false, true, false, "")
-	})
-	adminRestartSvcBtn := widget.NewButton("Restart Service", func() {
-		runAdminAction(false, false, false, true, "")
-	})
-	adminFullBtn := widget.NewButton("Full Apply (Install Cmd + Config + Service + Restart)", func() {
-		runAdminAction(true, true, true, true, "")
-	})
-	adminAutoBootstrapBtn := widget.NewButton("Auto Bootstrap + Deploy", func() {
-		cmd := buildAutoBootstrapCommand(
-			adminRepoURL.Text,
-			adminSourceDir.Text,
-			adminBuildOutput.Text,
-			adminBinaryPath.Text,
-			func() string {
-				if strings.TrimSpace(adminSudoPassword.Text) != "" {
-					return adminSudoPassword.Text
-				}
-				return adminSSHPassword.Text
-			}(),
-		)
-		runAdminAction(true, true, true, true, cmd)
+	runAdminCommandAction := func(title, cmd string) {
+		req, err := buildAdminRequest(false, false, false, false, "")
+		if err != nil {
+			dialog.ShowError(err, w)
+			adminStatus.SetText("Input error: " + err.Error())
+			return
+		}
+		adminStatus.SetText(title + " running...")
+		appendAdminLog(title + " started")
+		go func() {
+			okCount, failCount := runAdminCommandOnTargets(req, cmd, appendAdminLog)
+			fyne.Do(func() {
+				adminStatus.SetText(fmt.Sprintf("%s done. Success=%d Failed=%d", title, okCount, failCount))
+			})
+		}()
+	}
+
+	adminAddTargetBtn := widget.NewButton("Add Target", func() {
+		user := strings.TrimSpace(adminQuickUser.Text)
+		host := strings.TrimSpace(adminQuickHost.Text)
+		if user == "" {
+			user = strings.TrimSpace(adminDefaultUser.Text)
+		}
+		if user == "" || host == "" {
+			dialog.ShowError(fmt.Errorf("quick add requires user and host"), w)
+			return
+		}
+		port := strings.TrimSpace(adminQuickPort.Text)
+		line := user + "@" + host
+		if port != "" && port != "22" {
+			line += ":" + port
+		}
+		sshPass := strings.TrimSpace(adminQuickSSH.Text)
+		sudoPass := strings.TrimSpace(adminQuickSudo.Text)
+		if sshPass != "" {
+			line += " " + sshPass
+		}
+		if sudoPass != "" {
+			if sshPass == "" {
+				line += " "
+			}
+			line += " " + sudoPass
+		}
+		if strings.TrimSpace(adminTargetsEntry.Text) == "" {
+			adminTargetsEntry.SetText(line)
+		} else {
+			adminTargetsEntry.SetText(strings.TrimRight(adminTargetsEntry.Text, "\n") + "\n" + line)
+		}
+		appendAdminLog("Added target " + user + "@" + host)
 	})
 
-	adminConfigForm := widget.NewForm(
-		widget.NewFormItem("Servers", adminServersEntry),
+	adminClearTargetsBtn := widget.NewButton("Clear Targets", func() {
+		adminTargetsEntry.SetText("")
+	})
+
+	adminInstallReleaseBtn := widget.NewButton("Install From GitHub", func() {
+		repo := strings.TrimSpace(adminReleaseRepo.Text)
+		cmd := buildGitHubReleaseInstallCommand(repo, strings.TrimSpace(adminBinaryPath.Text))
+		runAdminBatchAction("Install From GitHub", false, true, false, false, cmd)
+	})
+
+	adminPullInfoBtn := widget.NewButton("Pull Server Info", func() {
+		cmd := buildServerInfoCommand(strings.TrimSpace(adminServiceName.Text), strings.TrimSpace(adminBinaryPath.Text))
+		runAdminCommandAction("Pull Server Info", cmd)
+	})
+
+	adminPullConfigBtn := widget.NewButton("Pull Config", func() {
+		req, err := buildAdminRequest(false, false, false, false, "")
+		if err != nil {
+			dialog.ShowError(err, w)
+			adminStatus.SetText("Input error: " + err.Error())
+			return
+		}
+		if len(req.Targets) == 0 {
+			dialog.ShowError(fmt.Errorf("no targets provided"), w)
+			return
+		}
+		target := req.Targets[0]
+		cmd := buildFetchConfigCommand(strings.TrimSpace(adminBinaryPath.Text))
+		adminStatus.SetText("Pulling config from " + target.Display + "...")
+		appendAdminLog("Pulling config from " + target.Display)
+		go func() {
+			out, err := runSSHCommand(target, req.sshPasswordFor(target), cmd, 10*time.Second, 45*time.Second)
+			if out != "" {
+				appendAdminLog(fmt.Sprintf("[%s] config output:\n%s", target.Display, out))
+			}
+			if err != nil {
+				fyne.Do(func() {
+					adminStatus.SetText("Pull config failed: " + err.Error())
+					dialog.ShowError(err, w)
+				})
+				return
+			}
+
+			block := extractMarkedBlock(out, "__FRNT_CONFIG_BEGIN__", "__FRNT_CONFIG_END__")
+			if strings.TrimSpace(block) == "" {
+				fyne.Do(func() {
+					adminStatus.SetText("Pull config failed: no block returned")
+					dialog.ShowError(fmt.Errorf("remote config block not found"), w)
+				})
+				return
+			}
+
+			current, _ := loadConfigFromForm()
+			parsed := parseFlexToolConfig(block, current)
+			fyne.Do(func() {
+				applyConfigToForm(parsed)
+				adminStatus.SetText("Pulled config from " + target.Display)
+			})
+		}()
+	})
+
+	adminPushConfigBtn := widget.NewButton("Push Config", func() {
+		runAdminBatchAction("Push Config", true, false, false, false, "")
+	})
+
+	adminRestartServiceBtn := widget.NewButton("Restart Service", func() {
+		runAdminBatchAction("Restart Service", false, false, false, true, "")
+	})
+
+	adminDeployBtn := widget.NewButton("Install + Push Config + Restart", func() {
+		repo := strings.TrimSpace(adminReleaseRepo.Text)
+		cmd := buildGitHubReleaseInstallCommand(repo, strings.TrimSpace(adminBinaryPath.Text))
+		runAdminBatchAction("Deploy", true, true, true, true, cmd)
+	})
+
+	adminRebootBtn := widget.NewButton("Reboot + Verify Service", func() {
+		req, err := buildAdminRequest(false, false, false, false, "")
+		if err != nil {
+			dialog.ShowError(err, w)
+			adminStatus.SetText("Input error: " + err.Error())
+			return
+		}
+		adminStatus.SetText("Reboot workflow running...")
+		appendAdminLog("Reboot workflow started")
+		go func() {
+			okCount, failCount := rebootTargetsAndWait(req, strings.TrimSpace(adminServiceName.Text), appendAdminLog)
+			fyne.Do(func() {
+				adminStatus.SetText(fmt.Sprintf("Reboot workflow done. Success=%d Failed=%d", okCount, failCount))
+			})
+		}()
+	})
+
+	adminClearLogBtn := widget.NewButton("Clear Log", func() {
+		adminLog.SetText("")
+	})
+
+	adminTargetsForm := widget.NewForm(
 		widget.NewFormItem("Default SSH User", adminDefaultUser),
-		widget.NewFormItem("SSH Password", adminSSHPassword),
-		widget.NewFormItem("Sudo Password", adminSudoPassword),
-		widget.NewFormItem("Repo URL", adminRepoURL),
-		widget.NewFormItem("Source Dir", adminSourceDir),
-		widget.NewFormItem("Build Output", adminBuildOutput),
-		widget.NewFormItem("Install Command", adminInstallCommand),
+		widget.NewFormItem("Default SSH Password", adminSSHPassword),
+		widget.NewFormItem("Default Sudo Password", adminSudoPassword),
+		widget.NewFormItem("Targets", adminTargetsEntry),
+	)
+
+	adminQuickAddRow := container.NewVBox(
+		widget.NewLabelWithStyle("Quick Add Target", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		container.NewGridWithColumns(3, adminQuickUser, adminQuickHost, adminQuickPort),
+		container.NewGridWithColumns(2, adminQuickSSH, adminQuickSudo),
+		container.NewHBox(adminAddTargetBtn, adminClearTargetsBtn),
+	)
+
+	adminConfigForm := widget.NewForm(
+		widget.NewFormItem("Release Repo (owner/name)", adminReleaseRepo),
 		widget.NewFormItem("Service Name", adminServiceName),
-		widget.NewFormItem("Server Binary Path", adminBinaryPath),
+		widget.NewFormItem("Binary Path", adminBinaryPath),
 		widget.NewFormItem("BROADCAST", adminBroadcast),
 		widget.NewFormItem("LISTEN_INTERFACE", adminListenIF),
 		widget.NewFormItem("SEND_INTERFACE", adminSendIF),
@@ -937,22 +1094,36 @@ func Run() {
 		widget.NewFormItem("MULTI_PROXY", adminMultiProxy),
 	)
 
+	adminActions := container.NewVBox(
+		widget.NewLabelWithStyle("Actions", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		container.NewHBox(adminInstallReleaseBtn, adminDeployBtn),
+		container.NewHBox(adminPullInfoBtn, adminPullConfigBtn),
+		container.NewHBox(adminPushConfigBtn, adminRestartServiceBtn),
+		container.NewHBox(adminRebootBtn),
+	)
+
+	targetsCard := widget.NewCard("Targets", "Use one line per server", container.NewVBox(adminTargetsForm, adminQuickAddRow))
+	configCard := widget.NewCard(".flextool Config", "Pull from server, edit, then repush", adminConfigForm)
+	actionsCard := widget.NewCard("Operations", "All actions write to the log", adminActions)
+
+	leftAdminPanel := container.NewVBox(targetsCard, configCard, actionsCard)
+	logPanel := widget.NewCard("Execution Log", "", container.NewBorder(container.NewHBox(layout.NewSpacer(), adminClearLogBtn), nil, nil, nil, adminLog))
+
+	adminSplit := container.NewHSplit(container.NewVScroll(leftAdminPanel), logPanel)
+	adminSplit.Offset = 0.64
+
 	adminPage := container.NewBorder(
 		container.NewVBox(
 			adminHeader,
 			adminHint,
 			adminStatus,
-			container.NewHBox(adminAutoBootstrapBtn),
-			container.NewHBox(adminApplyConfigBtn, adminInstallCmdBtn, adminInstallSvcBtn),
-			container.NewHBox(adminRestartSvcBtn, adminFullBtn),
 			widget.NewSeparator(),
 		),
 		nil,
 		nil,
 		nil,
-		container.NewVScroll(container.NewVBox(adminConfigForm, widget.NewSeparator(), adminLog)),
+		adminSplit,
 	)
-
 	// Refresh function so Firewall status never gets "stuck on checking..."
 	refreshFirewallStatus := func() {
 		checkID := atomic.AddUint64(&firewallCheckGeneration, 1)
