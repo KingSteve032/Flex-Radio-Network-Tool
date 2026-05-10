@@ -6,21 +6,11 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os"
 	"os/exec"
 	"strings"
 
 	"github.com/KingSteve032/Flex-Radio-Network-Tool/internal/procutil"
 )
-
-// netbirdCLIPath returns the CLI path/name to use.
-// If NETBIRD_CLI is set, we use that (useful for testing or portable installs).
-func netbirdCLIPath() string {
-	if p := os.Getenv("NETBIRD_CLI"); p != "" {
-		return p
-	}
-	return netbirdDefaultCLI
-}
 
 // discoverFlextoolRoutes runs:
 //

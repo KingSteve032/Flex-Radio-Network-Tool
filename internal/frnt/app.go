@@ -120,10 +120,7 @@ func logGPUInfo() {
 // --- NetBird + SmartSDR version helpers for About page ---
 
 func netbirdCLIPath() string {
-	if p := os.Getenv("NETBIRD_CLI"); p != "" {
-		return p
-	}
-	return "netbird"
+	return flexclient.NetbirdCLIPath()
 }
 
 // getNetbirdVersions runs "netbird status" and parses Daemon/CLI versions.
