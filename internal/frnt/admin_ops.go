@@ -16,6 +16,7 @@ import (
 )
 
 const sudoPasswordB64Token = "__FRNT_SUDO_PASSWORD_B64__"
+const systemConfigPath = "/etc/frnt/flextool"
 
 type adminTarget struct {
 	User    string
@@ -222,9 +223,21 @@ func envQuote(s string) string {
 	return `"` + s + `"`
 }
 
-func buildConfigApplyCommand(cfg adminFlexToolConfig) string {
+func buildConfigApplyCommand(cfg adminFlexToolConfig, sudoPassword string) string {
 	content := renderFlexToolConfig(cfg)
-	return "cat > \"$HOME/.flextool\" <<'FLEXTOOL_EOF'\n" + content + "FLEXTOOL_EOF\nchmod 600 \"$HOME/.flextool\""
+	tmp := "/tmp/frnt-flextool"
+
+	lines := []string{
+		"set -e",
+		"cat > " + shQuote(tmp) + " <<'FLEXTOOL_EOF'",
+		content + "FLEXTOOL_EOF",
+		"chmod 600 " + shQuote(tmp),
+		sudoWrap("mkdir -p "+shQuote(path.Dir(systemConfigPath)), sudoPassword),
+		sudoWrap("install -m 0600 "+shQuote(tmp)+" "+shQuote(systemConfigPath), sudoPassword),
+		"install -m 0600 " + shQuote(tmp) + " \"$HOME/.flextool\"",
+		"rm -f " + shQuote(tmp),
+	}
+	return strings.Join(lines, "\n")
 }
 
 func buildInstallServiceCommand(serviceName, binaryPath string, sudoPassword string) string {
@@ -249,13 +262,14 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%s
-ExecStart=%s --mode server listen
+EnvironmentFile=-%s
+ExecStart=%s --mode server --config %s listen
 Restart=always
 RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
-`, wd, binaryPath)
+`, wd, systemConfigPath, binaryPath, systemConfigPath)
 
 	tmp := "/tmp/" + serviceName
 	var b strings.Builder
@@ -278,6 +292,7 @@ func buildRestartServiceCommand(serviceName, sudoPassword string) string {
 		serviceName = "frnt-listen.service"
 	}
 	return strings.Join([]string{
+		sudoWrap("systemctl reset-failed "+shQuote(serviceName)+" || true", sudoPassword),
 		sudoWrap("systemctl restart "+shQuote(serviceName), sudoPassword),
 		sudoWrap("systemctl is-active "+shQuote(serviceName), sudoPassword),
 	}, "\n")
@@ -343,7 +358,7 @@ func buildGitHubReleaseInstallCommand(repoFullName, installPath string) string {
 	}
 
 	lines := []string{
-		"set -e",
+		"set -eu",
 		"arch=\"$(uname -m)\"",
 		"asset=\"\"",
 		"case \"$arch\" in",
@@ -353,18 +368,36 @@ func buildGitHubReleaseInstallCommand(repoFullName, installPath string) string {
 		"  *) echo \"Unsupported architecture: $arch\" >&2; exit 1 ;;",
 		"esac",
 		"url=\"https://github.com/" + repoFullName + "/releases/latest/download/${asset}\"",
+		"install_path=" + shQuote(installPath),
+		"sudo_password_b64=\"" + sudoPasswordB64Token + "\"",
 		"tmp=\"$(mktemp /tmp/frnt-release.XXXXXX)\"",
 		"trap 'rm -f \"$tmp\"' EXIT",
+		"echo \"Downloading ${asset} from ${url}\"",
 		"curl -fL --retry 3 --connect-timeout 10 -o \"$tmp\" \"$url\"",
-		"chmod +x \"$tmp\"",
-		"if sudo -n true >/dev/null 2>&1; then",
-		"  sudo -n install -m 0755 \"$tmp\" " + shQuote(installPath),
-		"elif [ -n \"" + sudoPasswordB64Token + "\" ]; then",
-		"  printf '%s' \"" + sudoPasswordB64Token + "\" | base64 -d | sudo -S -p '' install -m 0755 \"$tmp\" " + shQuote(installPath),
-		"else",
-		"  echo \"sudo password is required for install\" >&2",
+		"if [ ! -s \"$tmp\" ]; then",
+		"  echo \"Downloaded binary is missing or empty: ${tmp}\" >&2",
 		"  exit 1",
 		"fi",
+		"chmod +x \"$tmp\"",
+		"install_frnt_binary() {",
+		"  src=\"$1\"",
+		"  dst=\"$2\"",
+		"  if [ -z \"$src\" ] || [ ! -f \"$src\" ]; then",
+		"    echo \"Install source is missing: ${src}\" >&2",
+		"    exit 1",
+		"  fi",
+		"  echo \"Installing ${src} to ${dst}\"",
+		"  if sudo -n true >/dev/null 2>&1; then",
+		"    sudo -n install -m 0755 \"$src\" \"$dst\"",
+		"  elif [ -n \"$sudo_password_b64\" ]; then",
+		"    sudo_password=\"$(printf '%s' \"$sudo_password_b64\" | base64 -d)\"",
+		"    printf '%s\\n' \"$sudo_password\" | sudo -S -p '' install -m 0755 \"$src\" \"$dst\"",
+		"  else",
+		"    echo \"sudo password is required for install\" >&2",
+		"    exit 1",
+		"  fi",
+		"}",
+		"install_frnt_binary \"$tmp\" \"$install_path\"",
 	}
 	return strings.Join(lines, "\n")
 }
@@ -390,8 +423,9 @@ func buildServerInfoCommand(serviceName, binaryPath string) string {
 		binaryPath = "/usr/local/bin/frnt"
 	}
 	binaryDir := path.Dir(binaryPath)
-	configA := "$HOME/.flextool"
-	configB := binaryDir + "/.flextool"
+	configA := systemConfigPath
+	configB := "$HOME/.flextool"
+	configC := binaryDir + "/.flextool"
 
 	lines := []string{
 		"set -e",
@@ -410,7 +444,7 @@ func buildServerInfoCommand(serviceName, binaryPath string) string {
 		"systemctl --no-pager -l status " + shQuote(serviceName) + " | sed -n '1,18p' || true",
 		"echo \"SERVICE_STATUS_END\"",
 		"echo \"CONFIG_PATHS_BEGIN\"",
-		"for p in " + configA + " " + shQuote(configB) + "; do if [ -f \"$p\" ]; then echo \"$p\"; fi; done",
+		"for p in " + shQuote(configA) + " " + configB + " " + shQuote(configC) + "; do if [ -f \"$p\" ]; then echo \"$p\"; fi; done",
 		"echo \"CONFIG_PATHS_END\"",
 	}
 	return strings.Join(lines, "\n")
@@ -425,7 +459,9 @@ func buildFetchConfigCommand(binaryPath string) string {
 	lines := []string{
 		"set -e",
 		"echo \"__FRNT_CONFIG_BEGIN__\"",
-		"if [ -f \"$HOME/.flextool\" ]; then",
+		"if [ -f " + shQuote(systemConfigPath) + " ]; then",
+		"  cat " + shQuote(systemConfigPath),
+		"elif [ -f \"$HOME/.flextool\" ]; then",
 		"  cat \"$HOME/.flextool\"",
 		"elif [ -f " + shQuote(binaryDir+"/.flextool") + " ]; then",
 		"  cat " + shQuote(binaryDir+"/.flextool"),
@@ -564,7 +600,7 @@ func runAdminBatch(req adminBatchRequest, logf func(string)) (okCount, failCount
 		}
 
 		if req.ApplyConfig {
-			cmd := buildConfigApplyCommand(req.FlexToolConfig)
+			cmd := buildConfigApplyCommand(req.FlexToolConfig, sudoPassword)
 			out, err := runSSHCommand(t, sshPassword, cmd, req.ConnectTimeout, req.CommandTimeout)
 			if out != "" {
 				logf(fmt.Sprintf("[%s] config output:\n%s", t.Display, out))

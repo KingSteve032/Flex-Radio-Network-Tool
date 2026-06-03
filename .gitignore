@@ -1,6 +1,7 @@
 # Output
 dist/
 *.exe
+*.exe~
 
 # Local build/test caches (workspace-scoped for sandboxed runs)
 .gocache/
