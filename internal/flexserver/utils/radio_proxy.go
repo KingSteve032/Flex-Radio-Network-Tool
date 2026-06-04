@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,6 +24,7 @@ type radioEndpoint struct {
 }
 
 type proxySession struct {
+	ID       uint64
 	ClientIP string
 	Serial   string
 	RadioIP  string
@@ -35,9 +37,15 @@ type proxySession struct {
 var (
 	discoveredRadios       sync.Map // serial(lower) -> radioEndpoint
 	proxyListeners         sync.Map // serial(lower) -> bool
-	sessionsByRadio        sync.Map // radioIP -> *proxySession
+	activeProxySessions    sync.Map // session ID(uint64) -> *proxySession
 	selectedSerialByClient sync.Map // clientIP -> serial(lower)
+	nextProxySessionID     atomic.Uint64
 )
+
+type VitaProxyTarget struct {
+	ClientIP string
+	Port     int
+}
 
 func normalizeSerial(serial string) string {
 	return strings.ToLower(strings.TrimSpace(serial))
@@ -221,25 +229,25 @@ func handleProxyConnection(clientConn net.Conn, serial string, co ConfigOptions)
 		clientHost = clientConn.RemoteAddr().String()
 	}
 
-	// Ensure only one active session per radio endpoint. If a stale or duplicate
-	// connection exists, replace it.
-	closeSessionForRadio(ep.IP)
-
-	// SmartSDR may keep stale TCP proxy sockets around briefly when switching
-	// radios. In single-proxy mode we close all other sessions for this client.
-	// In multi-proxy mode we only close conflicting duplicate sessions.
-	closeConflictingSessionsForClient(clientHost, serial, ep.IP, co.MultiProxy)
+	// In single-proxy mode, preserve the old behavior of replacing any prior
+	// session for this radio/client. In multi-proxy mode, SmartSDR, CAT, and DAX
+	// may all keep concurrent TCP API sockets to the same radio.
+	if !co.MultiProxy {
+		closeSessionForRadio(ep.IP)
+		closeConflictingSessionsForClient(clientHost, serial, ep.IP, false)
+	}
 
 	session := &proxySession{
+		ID:       nextProxySessionID.Add(1),
 		ClientIP: clientHost,
 		Serial:   serial,
 		RadioIP:  ep.IP,
 		UDPPort:  4991, // default until client udpport command is seen
 		LastSeen: time.Now(),
 	}
-	sessionsByRadio.Store(ep.IP, session)
+	activeProxySessions.Store(session.ID, session)
 
-	fmt.Printf("[PROXY] session start serial=%s client=%s radio=%s:%d\n", serial, clientHost, ep.IP, ep.Port)
+	fmt.Printf("[PROXY] session start id=%d serial=%s client=%s radio=%s:%d\n", session.ID, serial, clientHost, ep.IP, ep.Port)
 
 	var wg sync.WaitGroup
 	var closeOnce sync.Once
@@ -264,9 +272,9 @@ func handleProxyConnection(clientConn net.Conn, serial string, co ConfigOptions)
 	}()
 
 	wg.Wait()
-	deleteSessionIfCurrent(ep.IP, session)
+	deleteSessionIfCurrent(session)
 
-	fmt.Printf("[PROXY] session end serial=%s client=%s\n", serial, clientHost)
+	fmt.Printf("[PROXY] session end id=%d serial=%s client=%s\n", session.ID, serial, clientHost)
 }
 
 func closeConflictingSessionsForClient(clientIP, serial, radioIP string, allowMulti bool) {
@@ -276,8 +284,11 @@ func closeConflictingSessionsForClient(clientIP, serial, radioIP string, allowMu
 	if clientIP == "" {
 		return
 	}
+	if allowMulti {
+		return
+	}
 
-	sessionsByRadio.Range(func(_, value any) bool {
+	activeProxySessions.Range(func(_, value any) bool {
 		s, ok := value.(*proxySession)
 		if !ok || s == nil {
 			return true
@@ -289,9 +300,7 @@ func closeConflictingSessionsForClient(clientIP, serial, radioIP string, allowMu
 		sameRadio := radioIP != "" && strings.TrimSpace(s.RadioIP) == radioIP
 		sameSerial := serial != "" && normalizeSerial(s.Serial) == serial
 		shouldClose := sameRadio || sameSerial
-		if !allowMulti {
-			shouldClose = true
-		}
+		shouldClose = shouldClose || !allowMulti
 		if !shouldClose {
 			return true
 		}
@@ -309,36 +318,27 @@ func closeSessionForRadio(radioIP string) {
 	if radioIP == "" {
 		return
 	}
-	v, ok := sessionsByRadio.Load(radioIP)
-	if !ok {
-		return
-	}
-	s, ok := v.(*proxySession)
-	if !ok || s == nil {
-		return
-	}
-	if s.closeNow != nil {
-		fmt.Printf("[PROXY] replacing existing session radio=%s client=%s serial=%s\n", radioIP, s.ClientIP, s.Serial)
-		s.closeNow()
-	}
+	activeProxySessions.Range(func(_, value any) bool {
+		s, ok := value.(*proxySession)
+		if !ok || s == nil {
+			return true
+		}
+		if strings.TrimSpace(s.RadioIP) != radioIP {
+			return true
+		}
+		if s.closeNow != nil {
+			fmt.Printf("[PROXY] replacing existing session radio=%s client=%s serial=%s\n", radioIP, s.ClientIP, s.Serial)
+			s.closeNow()
+		}
+		return true
+	})
 }
 
-func deleteSessionIfCurrent(radioIP string, current *proxySession) {
-	radioIP = strings.TrimSpace(radioIP)
-	if radioIP == "" || current == nil {
+func deleteSessionIfCurrent(current *proxySession) {
+	if current == nil {
 		return
 	}
-	v, ok := sessionsByRadio.Load(radioIP)
-	if !ok {
-		return
-	}
-	s, ok := v.(*proxySession)
-	if !ok {
-		return
-	}
-	if s == current {
-		sessionsByRadio.Delete(radioIP)
-	}
+	activeProxySessions.Delete(current.ID)
 }
 
 func terminateSession(session *proxySession, reason string) {
@@ -350,7 +350,7 @@ func terminateSession(session *proxySession, reason string) {
 			session.Serial, session.ClientIP, session.RadioIP, reason)
 	}
 	clearSelectedSerialForClient(session.ClientIP)
-	deleteSessionIfCurrent(session.RadioIP, session)
+	deleteSessionIfCurrent(session)
 	if session.closeNow != nil {
 		session.closeNow()
 	}
@@ -456,27 +456,74 @@ func parseClientUDPPortCommand(line []byte) (int, bool) {
 	return p, true
 }
 
-func GetVitaProxyTarget(radioIP string) (clientIP string, clientPort int, ok bool) {
-	v, found := sessionsByRadio.Load(radioIP)
-	if !found {
-		return "", 0, false
+func GetVitaProxyTargets(radioIP string, radioDstPort int) []VitaProxyTarget {
+	radioIP = strings.TrimSpace(radioIP)
+	if radioIP == "" {
+		return nil
 	}
-	s := v.(*proxySession)
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if time.Since(s.LastSeen) > 30*time.Second {
-		return "", 0, false
-	}
-	if s.ClientIP == "" || s.UDPPort <= 0 {
-		return "", 0, false
-	}
-	if selectedSerial, hasSelection := getSelectedSerialForClient(s.ClientIP); hasSelection {
-		if normalizeSerial(selectedSerial) != normalizeSerial(s.Serial) {
-			return "", 0, false
+	var exact []VitaProxyTarget
+	var fallback *proxySession
+	var fallbackLastSeen time.Time
+
+	activeProxySessions.Range(func(_, value any) bool {
+		s, ok := value.(*proxySession)
+		if !ok || s == nil {
+			return true
 		}
+		if strings.TrimSpace(s.RadioIP) != radioIP {
+			return true
+		}
+
+		s.mu.RLock()
+		clientIP := strings.TrimSpace(s.ClientIP)
+		serial := normalizeSerial(s.Serial)
+		udpPort := s.UDPPort
+		lastSeen := s.LastSeen
+		s.mu.RUnlock()
+
+		if time.Since(lastSeen) > 30*time.Second {
+			return true
+		}
+		if clientIP == "" || udpPort <= 0 {
+			return true
+		}
+		if selectedSerial, hasSelection := getSelectedSerialForClient(clientIP); hasSelection {
+			if normalizeSerial(selectedSerial) != serial {
+				return true
+			}
+		}
+
+		target := VitaProxyTarget{ClientIP: clientIP, Port: udpPort}
+		if radioDstPort > 0 && udpPort == radioDstPort {
+			exact = append(exact, target)
+			return true
+		}
+		if fallback == nil || lastSeen.After(fallbackLastSeen) {
+			fallback = s
+			fallbackLastSeen = lastSeen
+		}
+		return true
+	})
+
+	if len(exact) > 0 {
+		return exact
 	}
-	return s.ClientIP, s.UDPPort, true
+	if fallback == nil {
+		return nil
+	}
+
+	fallback.mu.RLock()
+	defer fallback.mu.RUnlock()
+	return []VitaProxyTarget{{ClientIP: strings.TrimSpace(fallback.ClientIP), Port: fallback.UDPPort}}
+}
+
+func GetVitaProxyTarget(radioIP string) (clientIP string, clientPort int, ok bool) {
+	targets := GetVitaProxyTargets(radioIP, 0)
+	if len(targets) == 0 {
+		return "", 0, false
+	}
+	return targets[0].ClientIP, targets[0].Port, true
 }
 
 // IsKnownRadioIP reports whether this IP matches any discovered radio endpoint.

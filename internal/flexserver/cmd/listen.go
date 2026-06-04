@@ -266,12 +266,18 @@ func ListenForVitaStreamPackets(co utils.ConfigOptions) error {
 			continue
 		}
 
-		// Proxy mode: packet is destined to server IP, so route by radio session.
-		if proxyClientIP, proxyClientPort, ok := utils.GetVitaProxyTarget(radioIP); ok {
-			// In proxy mode, SmartSDR expects stream UDP on its negotiated
-			// client udpport (learned from the proxied TCP command channel).
-			proxyModePayload := buildVitaProxyPayload(uint16(proxyClientPort), udp.Payload)
-			if utils.SendPayloadToAuthorizedRegisteredClient(proxyClientIP, co, proxyModePayload, "VITA-PROXY") {
+		// Proxy mode: packet is destined to server IP, so route by the proxied
+		// TCP session whose negotiated UDP port matches this radio packet.
+		proxyTargets := utils.GetVitaProxyTargets(radioIP, int(udp.DstPort))
+		if len(proxyTargets) > 0 {
+			sent := false
+			for _, target := range proxyTargets {
+				proxyModePayload := buildVitaProxyPayload(uint16(target.Port), udp.Payload)
+				if utils.SendPayloadToAuthorizedRegisteredClient(target.ClientIP, co, proxyModePayload, "VITA-PROXY") {
+					sent = true
+				}
+			}
+			if sent {
 				continue
 			}
 		}
