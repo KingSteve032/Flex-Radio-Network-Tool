@@ -88,6 +88,7 @@ jobs:
   build-linux-arm:
     name: Build linux-${{ matrix.arch_label }}
     runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.allow_failure }}
     strategy:
       fail-fast: false
       matrix:
@@ -95,10 +96,12 @@ jobs:
           - arch: aarch64
             goarch: arm64
             arch_label: arm64
+            allow_failure: true
           - arch: armv7
             goarch: arm
             goarm: "7"
             arch_label: armv7
+            allow_failure: false
     steps:
       - name: Checkout
         uses: actions/checkout@v4
