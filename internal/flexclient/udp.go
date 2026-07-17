@@ -1,6 +1,7 @@
 package flexclient
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -21,12 +22,25 @@ import (
 )
 
 const (
-	radioModeDirect      = "direct"
-	radioModeProxy       = "proxy"
-	radioModeOff         = "off"
-	defaultProxyBasePort = 30000
-	proxyPortSpan        = 20000
+	radioModeDirect       = "direct"
+	radioModeProxy        = "proxy"
+	radioModeOff          = "off"
+	defaultProxyBasePort  = 30000
+	proxyPortSpan         = 20000
+	udpSocketBufferSize   = 4 * 1024 * 1024
+	vitaForwardQueueSize  = 4096
+	vitaForwardPrimeWait  = 80 * time.Millisecond
+	vitaForwardIdleReset  = 200 * time.Millisecond
+	directAssistQueueSize = 1024
+	directAssistPrimeWait = 20 * time.Millisecond
+	directAssistIdleReset = 150 * time.Millisecond
+	directPunchVITAPort   = 4991
+	directPunchInterval   = 10 * time.Second
 )
+
+var directAssistRadioUDPPorts = []int{4991, 4993}
+
+const directAssistRadioTXPort = 4991
 
 var (
 	ipFieldRe   = regexp.MustCompile(`\bip=\S+`)
@@ -36,21 +50,37 @@ var (
 	clientConfigLoaded bool
 	clientConfig       radioModeConfig
 
-	vitaLogMu       sync.Mutex
-	vitaLastLogByID = map[string]time.Time{}
-	vitaCountByID   = map[string]uint64{}
+	vitaLogMu            sync.Mutex
+	vitaLastLogByID      = map[string]time.Time{}
+	vitaLastPacketByID   = map[string]time.Time{}
+	vitaLastLogCountByID = map[string]uint64{}
+	vitaCountByID        = map[string]uint64{}
+	vitaBytesByID        = map[string]uint64{}
+	vitaLastLogBytesByID = map[string]uint64{}
+	vitaMaxGapByID       = map[string]time.Duration{}
+	vitaForwardLogMu     sync.Mutex
+	vitaForwardLastLog   = map[string]time.Time{}
+	vitaForwardLastWrite = map[string]time.Time{}
+	vitaForwardLastCount = map[string]uint64{}
+	vitaForwardCount     = map[string]uint64{}
+	vitaForwardMaxGap    = map[string]time.Duration{}
+	vitaForwardMu        sync.Mutex
+	vitaForwardConn      = map[string]*net.UDPConn{}
+	vitaForwardQueue     = map[string]chan vitaForwardFrame{}
+	discoveryLogMu       sync.Mutex
+	discoveryLastLog     = map[string]time.Time{}
 
 	identityMu             sync.Mutex
 	identityBySerialCached = map[string]discoveryIdentity{} // key: serial(lower)
 
-	localProxyMu       sync.Mutex
-	localProxyBySerial = map[string]*localProxyListener{} // key: serial(lower)
-
-	proxySelectMu   sync.Mutex
-	proxySelectSent = map[string]time.Time{} // key: routeID|serial
+	localDirectAssistMu       sync.Mutex
+	localDirectAssistBySerial = map[string]*localDirectAssistListener{} // key: serial(lower)
 
 	serialOwnerMu   sync.Mutex
 	serialOwnerByID = map[string]serialRouteOwner{} // key: serial(lower)
+
+	directPunchMu    sync.Mutex
+	directPunchConns = map[string]*directPunchConn{}
 
 	rebroadcastMu    sync.Mutex
 	rebroadcastConns []*net.UDPConn
@@ -77,17 +107,46 @@ type discoveryIdentity struct {
 	version  string
 }
 
-type localProxyListener struct {
-	serial   string
-	routeID  string
-	serverIP string
-	listenIP string
-	ln       net.Listener
+type localDirectAssistListener struct {
+	serial    string
+	routeID   string
+	clientIP  string
+	radioIP   string
+	radioPort int
+	listenIP  string
+	ln        net.Listener
+	udpConns  []*net.UDPConn
+
+	mu             sync.RWMutex
+	vitaBySmartUDP map[int]*directAssistVITASession
+
+	closeOnce sync.Once
+	done      chan struct{}
+}
+
+type directAssistVITASession struct {
+	smartSDRPort int
+	conn         *net.UDPConn
+	vitaPort     int
+	packets      uint64
+	lastLog      time.Time
+	lastBytes    uint64
 }
 
 type serialRouteOwner struct {
 	routeID  string
 	lastSeen time.Time
+}
+
+type vitaForwardFrame struct {
+	destIP  net.IP
+	dstPort int
+	data    []byte
+}
+
+type directPunchConn struct {
+	conn     *net.UDPConn
+	lastSent time.Time
 }
 
 func loadRadioModeConfigFromEnv() radioModeConfig {
@@ -119,11 +178,11 @@ func loadRadioModeConfigFromEnv() radioModeConfig {
 			}
 
 			serial := strings.ToLower(strings.TrimSpace(kv[0]))
-			mode := strings.ToLower(strings.TrimSpace(kv[1]))
+			mode := normalizeRadioMode(strings.TrimSpace(kv[1]))
 			if serial == "" {
 				continue
 			}
-			if mode != radioModeDirect && mode != radioModeProxy && mode != radioModeOff {
+			if mode == "" {
 				continue
 			}
 			cfg.PerRadioModes[serial] = mode
@@ -174,7 +233,7 @@ func loadRadioModeConfig() radioModeConfig {
 	return out
 }
 
-// SetRadioModeSettings applies explicit per-radio direct/proxy/off mode configuration
+// SetRadioModeSettings applies explicit per-radio on/off mode configuration
 // at runtime. Invalid entries are ignored.
 func SetRadioModeSettings(proxyBasePort int, perRadioModes map[string]string) {
 	ensureRadioModeConfigLoaded()
@@ -186,11 +245,11 @@ func SetRadioModeSettings(proxyBasePort int, perRadioModes map[string]string) {
 	sanitized := map[string]string{}
 	for serial, mode := range perRadioModes {
 		s := strings.ToLower(strings.TrimSpace(serial))
-		m := strings.ToLower(strings.TrimSpace(mode))
+		m := normalizeRadioMode(mode)
 		if s == "" {
 			continue
 		}
-		if m != radioModeDirect && m != radioModeProxy && m != radioModeOff {
+		if m == "" {
 			continue
 		}
 		sanitized[s] = m
@@ -229,11 +288,11 @@ func GetRadioMode(serial string) string {
 func SetRadioModeForSerial(serial, mode string) {
 	basePort, modes := GetRadioModeSettings()
 	s := strings.ToLower(strings.TrimSpace(serial))
-	m := strings.ToLower(strings.TrimSpace(mode))
+	m := normalizeRadioMode(mode)
 	if s == "" {
 		return
 	}
-	if m != radioModeDirect && m != radioModeProxy && m != radioModeOff {
+	if m == "" {
 		return
 	}
 	modes[s] = m
@@ -307,82 +366,143 @@ func radioModeForSerial(serial string) string {
 	cfg := loadRadioModeConfig()
 	serial = strings.ToLower(strings.TrimSpace(serial))
 	if mode, ok := cfg.PerRadioModes[serial]; ok {
-		return mode
+		if normalized := normalizeRadioMode(mode); normalized != "" {
+			return normalized
+		}
 	}
 	return radioModeDirect
 }
 
-func proxyPortForSerial(serial string) int {
-	cfg := loadRadioModeConfig()
-	sum := crc32.ChecksumIEEE([]byte(strings.ToLower(strings.TrimSpace(serial))))
-	return cfg.ProxyBasePort + int(sum%proxyPortSpan)
+func normalizeRadioMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "on", "enabled", "enable", "true", "yes", radioModeDirect, radioModeProxy:
+		return radioModeDirect
+	case radioModeOff, "disabled", "disable", "false", "no":
+		return radioModeOff
+	default:
+		return ""
+	}
 }
 
-func maybeSendProxySelect(conn *net.UDPConn, routeID, clientIP, serial string) {
-	if conn == nil {
+func directPunchEnabled() bool {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("FLEXCLIENT_DIRECT_PUNCH")))
+	switch raw {
+	case "0", "false", "no", "off", "disabled":
+		return false
+	default:
+		return true
+	}
+}
+
+func directPunchPort() int {
+	raw := strings.TrimSpace(os.Getenv("FLEXCLIENT_DIRECT_PUNCH_PORT"))
+	if raw == "" {
+		return directPunchVITAPort
+	}
+	port, err := strconv.Atoi(raw)
+	if err != nil || port <= 0 || port >= 65536 {
+		return directPunchVITAPort
+	}
+	return port
+}
+
+func directAssistEnabled() bool {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("FLEXCLIENT_DIRECT_ASSIST")))
+	switch raw {
+	case "0", "false", "no", "off", "disabled":
+		return false
+	default:
+		return true
+	}
+}
+
+func maybeSendDirectRadioPunch(routeID, serial, clientIP string, payload []byte, discoveryText string) {
+	if !directPunchEnabled() {
 		return
 	}
+
 	serial = strings.ToLower(strings.TrimSpace(serial))
-	if serial == "" {
-		return
-	}
 	clientIP = strings.TrimSpace(clientIP)
-	if clientIP == "" {
+	if routeID == "" || serial == "" || clientIP == "" {
 		return
 	}
 
-	key := routeID + "|" + serial
-	now := time.Now()
+	if strings.TrimSpace(discoveryText) == "" && len(payload) > 0 {
+		_, text, err := extractDiscoveryText(payload)
+		if err != nil {
+			return
+		}
+		discoveryText = text
+	}
 
-	proxySelectMu.Lock()
-	last := proxySelectSent[key]
-	if now.Sub(last) < 3*time.Second {
-		proxySelectMu.Unlock()
+	radioIP := net.ParseIP(strings.TrimSpace(fieldValue(discoveryText, "ip"))).To4()
+	if radioIP == nil {
 		return
 	}
-	proxySelectSent[key] = now
-	proxySelectMu.Unlock()
 
-	msg := fmt.Sprintf("PROXY_SELECT client_ip=%s serial=%s", clientIP, serial)
-	if _, err := conn.Write([]byte(msg)); err != nil {
-		log.Printf("flexclient[%s]: failed to send PROXY_SELECT serial=%s: %v", routeID, serial, err)
+	localIP := net.ParseIP(clientIP).To4()
+	port := directPunchPort()
+	dest := &net.UDPAddr{IP: radioIP, Port: port}
+	localKey := clientIP
+	if localIP == nil {
+		localKey = ""
+	}
+	key := routeID + "|" + serial + "|" + localKey + "->" + dest.String()
+
+	directPunchMu.Lock()
+	entry := directPunchConns[key]
+	if entry != nil && time.Since(entry.lastSent) < directPunchInterval {
+		directPunchMu.Unlock()
 		return
 	}
-	log.Printf("flexclient[%s]: sent PROXY_SELECT serial=%s", routeID, serial)
+	if entry == nil || entry.conn == nil {
+		conn, err := dialDirectPunchUDP(localIP, dest)
+		if err != nil {
+			directPunchMu.Unlock()
+			log.Printf("flexclient[%s]: direct UDP punch setup failed serial=%s radio=%s err=%v",
+				routeID, serial, dest.String(), err)
+			return
+		}
+		entry = &directPunchConn{conn: conn}
+		directPunchConns[key] = entry
+	}
+	entry.lastSent = time.Now()
+	conn := entry.conn
+	directPunchMu.Unlock()
+
+	if _, err := conn.Write([]byte("FRNT_DIRECT_PUNCH")); err != nil {
+		directPunchMu.Lock()
+		if current := directPunchConns[key]; current == entry {
+			delete(directPunchConns, key)
+		}
+		directPunchMu.Unlock()
+		_ = conn.Close()
+		log.Printf("flexclient[%s]: direct UDP punch failed serial=%s radio=%s err=%v",
+			routeID, serial, dest.String(), err)
+		return
+	}
+
+	log.Printf("flexclient[%s]: direct UDP punch serial=%s %s -> %s",
+		routeID, serial, clientIP, dest.String())
 }
 
-func sendProxySelectForActiveTCPProxy(serverIP, serial string) {
-	serverIP = strings.TrimSpace(serverIP)
-	serial = strings.ToLower(strings.TrimSpace(serial))
-	if serverIP == "" || serial == "" {
-		return
+func dialDirectPunchUDP(localIP net.IP, dest *net.UDPAddr) (*net.UDPConn, error) {
+	if dest == nil || dest.IP == nil || dest.Port <= 0 {
+		return nil, fmt.Errorf("invalid direct punch destination")
 	}
-
-	addr := &net.UDPAddr{
-		IP:   net.ParseIP(serverIP),
-		Port: serverPort,
+	if localIP != nil {
+		conn, err := net.DialUDP("udp4", &net.UDPAddr{IP: localIP, Port: 0}, dest)
+		if err == nil {
+			_ = conn.SetWriteBuffer(udpSocketBufferSize)
+			return conn, nil
+		}
 	}
-	if addr.IP == nil {
-		return
-	}
-
-	conn, err := net.DialUDP("udp", nil, addr)
+	conn, err := net.DialUDP("udp4", nil, dest)
 	if err != nil {
-		return
+		return nil, err
 	}
-	defer conn.Close()
-
-	localAddr, _ := conn.LocalAddr().(*net.UDPAddr)
-	clientIP := ""
-	if localAddr != nil && localAddr.IP != nil {
-		clientIP = strings.TrimSpace(localAddr.IP.String())
-	}
-	if clientIP == "" {
-		return
-	}
-
-	msg := fmt.Sprintf("PROXY_SELECT client_ip=%s serial=%s", clientIP, serial)
-	_, _ = conn.Write([]byte(msg))
+	_ = conn.SetWriteBuffer(udpSocketBufferSize)
+	return conn, nil
 }
 
 func claimSerialOwner(routeID, serial string, now time.Time) bool {
@@ -442,7 +562,9 @@ func resetSerialOwnership() {
 	defer serialOwnerMu.Unlock()
 	serialOwnerByID = map[string]serialRouteOwner{}
 
-	closeAllLocalProxyListeners()
+	closeAllLocalDirectAssistListeners()
+	resetVitaForwardConns()
+	resetDirectPunchConns()
 }
 
 func resetIdentityCache() {
@@ -571,30 +693,32 @@ func loopbackIPForSerial(serial string, salt uint32) string {
 	return fmt.Sprintf("127.77.%d.%d", o3, o4)
 }
 
-func ensureLocalProxyListener(serial, routeID, serverIP string) (string, error) {
+func ensureLocalDirectAssistListener(serial, routeID, clientIP, radioIP string, radioPort int) (string, error) {
 	serial = strings.ToLower(strings.TrimSpace(serial))
 	routeID = strings.TrimSpace(routeID)
-	serverIP = strings.TrimSpace(serverIP)
-	if serial == "" || routeID == "" || serverIP == "" {
-		return "", fmt.Errorf("invalid local proxy listener args")
+	clientIP = strings.TrimSpace(clientIP)
+	radioIP = strings.TrimSpace(radioIP)
+	if radioPort <= 0 || radioPort >= 65536 {
+		radioPort = broadcastPort
+	}
+	if serial == "" || routeID == "" || clientIP == "" || net.ParseIP(radioIP) == nil {
+		return "", fmt.Errorf("invalid local direct assist args")
 	}
 
-	localProxyMu.Lock()
-	if existing, ok := localProxyBySerial[serial]; ok && existing != nil {
-		if existing.routeID == routeID && existing.serverIP == serverIP {
+	localDirectAssistMu.Lock()
+	if existing, ok := localDirectAssistBySerial[serial]; ok && existing != nil {
+		if existing.routeID == routeID && existing.clientIP == clientIP && existing.radioIP == radioIP && existing.radioPort == radioPort {
 			ip := existing.listenIP
-			localProxyMu.Unlock()
+			localDirectAssistMu.Unlock()
 			return ip, nil
 		}
-		if existing.ln != nil {
-			_ = existing.ln.Close()
-		}
-		delete(localProxyBySerial, serial)
+		closeLocalDirectAssist(existing)
+		delete(localDirectAssistBySerial, serial)
 	}
-	localProxyMu.Unlock()
+	localDirectAssistMu.Unlock()
 
 	var lastErr error
-	for attempt := uint32(0); attempt < 64; attempt++ {
+	for attempt := uint32(1024); attempt < 1088; attempt++ {
 		listenIP := loopbackIPForSerial(serial, attempt)
 		addr := net.JoinHostPort(listenIP, strconv.Itoa(broadcastPort))
 		ln, err := net.Listen("tcp", addr)
@@ -602,86 +726,465 @@ func ensureLocalProxyListener(serial, routeID, serverIP string) (string, error) 
 			lastErr = err
 			continue
 		}
-
-		lp := &localProxyListener{
-			serial:   serial,
-			routeID:  routeID,
-			serverIP: serverIP,
-			listenIP: listenIP,
-			ln:       ln,
+		udpConns, err := listenDirectAssistUDPConns(listenIP)
+		if err != nil {
+			_ = ln.Close()
+			lastErr = err
+			continue
 		}
-		localProxyMu.Lock()
-		localProxyBySerial[serial] = lp
-		localProxyMu.Unlock()
 
-		go runLocalProxyAcceptLoop(lp)
-		log.Printf("flexclient[%s]: local proxy listener serial=%s on %s -> %s:%d",
-			routeID, serial, addr, serverIP, proxyPortForSerial(serial))
+		da := &localDirectAssistListener{
+			serial:         serial,
+			routeID:        routeID,
+			clientIP:       clientIP,
+			radioIP:        radioIP,
+			radioPort:      radioPort,
+			listenIP:       listenIP,
+			ln:             ln,
+			udpConns:       udpConns,
+			vitaBySmartUDP: map[int]*directAssistVITASession{},
+			done:           make(chan struct{}),
+		}
+
+		localDirectAssistMu.Lock()
+		localDirectAssistBySerial[serial] = da
+		localDirectAssistMu.Unlock()
+
+		go runLocalDirectAssistAcceptLoop(da)
+		for _, udpConn := range udpConns {
+			go runLocalDirectAssistUDPForwardLoop(da, udpConn)
+		}
+		log.Printf("flexclient[%s]: local direct assist serial=%s on %s -> %s:%d",
+			routeID, serial, addr, radioIP, radioPort)
 		return listenIP, nil
 	}
 
 	if lastErr == nil {
-		lastErr = fmt.Errorf("failed to bind local proxy listener")
+		lastErr = fmt.Errorf("failed to bind local direct assist listener")
 	}
 	return "", lastErr
 }
 
-func runLocalProxyAcceptLoop(lp *localProxyListener) {
+func listenDirectAssistUDPConns(listenIP string) ([]*net.UDPConn, error) {
+	ports := []int{directAssistRadioTXPort, broadcastPort}
+	seen := map[int]bool{}
+	var conns []*net.UDPConn
+	for _, port := range ports {
+		if port <= 0 || port >= 65536 || seen[port] {
+			continue
+		}
+		seen[port] = true
+		udpAddr := &net.UDPAddr{IP: net.ParseIP(listenIP), Port: port}
+		udpConn, err := net.ListenUDP("udp", udpAddr)
+		if err != nil {
+			for _, conn := range conns {
+				_ = conn.Close()
+			}
+			return nil, err
+		}
+		_ = udpConn.SetReadBuffer(udpSocketBufferSize)
+		_ = udpConn.SetWriteBuffer(udpSocketBufferSize)
+		conns = append(conns, udpConn)
+	}
+	if len(conns) == 0 {
+		return nil, fmt.Errorf("failed to bind local direct assist UDP listeners")
+	}
+	return conns, nil
+}
+
+func runLocalDirectAssistAcceptLoop(da *localDirectAssistListener) {
 	for {
-		clientConn, err := lp.ln.Accept()
+		clientConn, err := da.ln.Accept()
 		if err != nil {
 			return
 		}
-		go bridgeLocalProxyConn(lp, clientConn)
+		go bridgeLocalDirectAssistConn(da, clientConn)
 	}
 }
 
-func bridgeLocalProxyConn(lp *localProxyListener, clientConn net.Conn) {
-	defer clientConn.Close()
-
-	target := net.JoinHostPort(lp.serverIP, strconv.Itoa(proxyPortForSerial(lp.serial)))
-	serverConn, err := net.DialTimeout("tcp", target, 7*time.Second)
-	if err != nil {
-		log.Printf("flexclient[%s]: local proxy dial failed serial=%s target=%s err=%v",
-			lp.routeID, lp.serial, target, err)
+func runLocalDirectAssistUDPForwardLoop(da *localDirectAssistListener, udpConn *net.UDPConn) {
+	if da == nil || udpConn == nil {
 		return
 	}
-	defer serverConn.Close()
+	radioIP := net.ParseIP(da.radioIP)
+	if radioIP == nil {
+		return
+	}
+	dest := &net.UDPAddr{IP: radioIP, Port: directAssistRadioTXPort}
+	var localAddr *net.UDPAddr
+	if clientIP := net.ParseIP(da.clientIP).To4(); clientIP != nil {
+		localAddr = &net.UDPAddr{IP: clientIP, Port: 0}
+	}
+	txConn, err := net.DialUDP("udp4", localAddr, dest)
+	if err != nil {
+		log.Printf("flexclient[%s]: local direct assist TX dial failed serial=%s dest=%s err=%v",
+			da.routeID, da.serial, dest.String(), err)
+		return
+	}
+	defer txConn.Close()
+	_ = txConn.SetWriteBuffer(udpSocketBufferSize)
 
-	sendProxySelectForActiveTCPProxy(lp.serverIP, lp.serial)
+	buf := make([]byte, 8192)
+	for {
+		n, addr, err := udpConn.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		if n <= 0 {
+			continue
+		}
+		if _, err := txConn.Write(buf[:n]); err != nil {
+			log.Printf("flexclient[%s]: local direct assist TX write failed serial=%s dest=%s err=%v",
+				da.routeID, da.serial, dest.String(), err)
+			return
+		}
+		logDirectAssistTX(da, addr, n, dest)
+	}
+}
+
+var directAssistTXLogMu sync.Mutex
+var directAssistTXLastLog = map[string]time.Time{}
+var directAssistTXPackets = map[string]uint64{}
+var directAssistTXBytes = map[string]uint64{}
+
+func logDirectAssistTX(da *localDirectAssistListener, src *net.UDPAddr, n int, dest *net.UDPAddr) {
+	if da == nil || src == nil || dest == nil {
+		return
+	}
+	key := da.serial + "|" + src.String()
+	now := time.Now()
+
+	directAssistTXLogMu.Lock()
+	defer directAssistTXLogMu.Unlock()
+	directAssistTXPackets[key]++
+	directAssistTXBytes[key] += uint64(n)
+	if now.Sub(directAssistTXLastLog[key]) < 5*time.Second {
+		return
+	}
+	directAssistTXLastLog[key] = now
+	log.Printf("flexclient[%s]: local direct assist TX serial=%s local=%s packets=%d bytes=%d -> radio=%s",
+		da.routeID, da.serial, src.String(), directAssistTXPackets[key], directAssistTXBytes[key], dest.String())
+	directAssistTXPackets[key] = 0
+	directAssistTXBytes[key] = 0
+}
+
+func bridgeLocalDirectAssistConn(da *localDirectAssistListener, clientConn net.Conn) {
+	defer clientConn.Close()
+
+	target := net.JoinHostPort(da.radioIP, strconv.Itoa(da.radioPort))
+	radioConn, err := net.DialTimeout("tcp", target, 7*time.Second)
+	if err != nil {
+		log.Printf("flexclient[%s]: local direct assist dial failed serial=%s target=%s err=%v",
+			da.routeID, da.serial, target, err)
+		return
+	}
+	defer radioConn.Close()
 
 	var wg sync.WaitGroup
 	var closeOnce sync.Once
 	closeBoth := func() {
 		closeOnce.Do(func() {
 			_ = clientConn.Close()
-			_ = serverConn.Close()
+			_ = radioConn.Close()
 		})
 	}
 
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(serverConn, clientConn)
+		copySmartSDRToRadioWithDirectAssist(da, clientConn, radioConn)
 		closeBoth()
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(clientConn, serverConn)
+		_, _ = io.Copy(clientConn, radioConn)
 		closeBoth()
 	}()
 	wg.Wait()
 }
 
-func closeAllLocalProxyListeners() {
-	localProxyMu.Lock()
-	defer localProxyMu.Unlock()
-	for serial, lp := range localProxyBySerial {
-		if lp != nil && lp.ln != nil {
-			_ = lp.ln.Close()
+func copySmartSDRToRadioWithDirectAssist(da *localDirectAssistListener, src net.Conn, dst net.Conn) {
+	reader := bufio.NewReader(src)
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			out := rewriteClientUDPPortForDirectAssist(da, line)
+			if len(out) > 0 {
+				if _, writeErr := dst.Write(out); writeErr != nil {
+					return
+				}
+			}
 		}
-		delete(localProxyBySerial, serial)
+		if err != nil {
+			return
+		}
 	}
+}
+
+func rewriteClientUDPPortForDirectAssist(da *localDirectAssistListener, line []byte) []byte {
+	if da == nil || len(line) == 0 {
+		return line
+	}
+
+	lower := strings.ToLower(string(line))
+	const needle = "client udpport "
+	idx := strings.Index(lower, needle)
+	if idx < 0 {
+		return line
+	}
+
+	start := idx + len(needle)
+	end := start
+	for end < len(lower) && lower[end] >= '0' && lower[end] <= '9' {
+		end++
+	}
+	if end == start {
+		return line
+	}
+
+	origPort, err := strconv.Atoi(lower[start:end])
+	if err != nil || origPort <= 0 || origPort >= 65536 {
+		return line
+	}
+
+	vitaPort, err := ensureDirectAssistVITAConn(da, origPort)
+	if err != nil {
+		log.Printf("flexclient[%s]: local direct assist VITA setup failed serial=%s smart_port=%d err=%v",
+			da.routeID, da.serial, origPort, err)
+		return line
+	}
+
+	replacement := []byte(strconv.Itoa(vitaPort))
+	out := make([]byte, 0, len(line)+len(replacement)-(end-start))
+	out = append(out, line[:start]...)
+	out = append(out, replacement...)
+	out = append(out, line[end:]...)
+	log.Printf("flexclient[%s]: local direct assist serial=%s client udpport %d -> %d",
+		da.routeID, da.serial, origPort, vitaPort)
+	return out
+}
+
+func ensureDirectAssistVITAConn(da *localDirectAssistListener, smartSDRPort int) (int, error) {
+	if da == nil || smartSDRPort <= 0 || smartSDRPort >= 65536 {
+		return 0, fmt.Errorf("invalid SmartSDR UDP port")
+	}
+
+	da.mu.Lock()
+	defer da.mu.Unlock()
+	if da.vitaBySmartUDP == nil {
+		da.vitaBySmartUDP = map[int]*directAssistVITASession{}
+	}
+	if session := da.vitaBySmartUDP[smartSDRPort]; session != nil && session.conn != nil && session.vitaPort > 0 {
+		return session.vitaPort, nil
+	}
+
+	localIP := net.ParseIP(da.clientIP).To4()
+	localAddr := &net.UDPAddr{IP: localIP, Port: 0}
+	conn, err := net.ListenUDP("udp4", localAddr)
+	if err != nil && localIP != nil {
+		conn, err = net.ListenUDP("udp4", &net.UDPAddr{Port: 0})
+	}
+	if err != nil {
+		return 0, err
+	}
+	_ = conn.SetReadBuffer(udpSocketBufferSize)
+	_ = conn.SetWriteBuffer(udpSocketBufferSize)
+
+	localUDP, _ := conn.LocalAddr().(*net.UDPAddr)
+	if localUDP == nil || localUDP.Port <= 0 {
+		_ = conn.Close()
+		return 0, fmt.Errorf("failed to determine local VITA UDP port")
+	}
+
+	session := &directAssistVITASession{
+		smartSDRPort: smartSDRPort,
+		conn:         conn,
+		vitaPort:     localUDP.Port,
+	}
+	da.vitaBySmartUDP[smartSDRPort] = session
+	go runDirectAssistVITAForwardLoop(da, session)
+	go runDirectAssistVITAKeepaliveLoop(da, session)
+
+	log.Printf("flexclient[%s]: local direct assist VITA serial=%s listen=%s smart_udp=127.0.0.1:%d radio=%s:%v",
+		da.routeID, da.serial, localUDP.String(), smartSDRPort, da.radioIP, directAssistRadioUDPPorts)
+	return session.vitaPort, nil
+}
+
+func runDirectAssistVITAKeepaliveLoop(da *localDirectAssistListener, session *directAssistVITASession) {
+	if session == nil || session.conn == nil {
+		return
+	}
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	radioIP := net.ParseIP(da.radioIP)
+	if radioIP == nil {
+		return
+	}
+	payload := []byte("FRNT_DIRECT_ASSIST")
+
+	for {
+		select {
+		case <-da.done:
+			return
+		case <-ticker.C:
+			for _, port := range directAssistRadioUDPPorts {
+				if port <= 0 || port >= 65536 {
+					continue
+				}
+				_, _ = session.conn.WriteToUDP(payload, &net.UDPAddr{IP: radioIP, Port: port})
+			}
+		}
+	}
+}
+
+func runDirectAssistVITAForwardLoop(da *localDirectAssistListener, session *directAssistVITASession) {
+	if session == nil || session.conn == nil {
+		return
+	}
+	dest := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: session.smartSDRPort}
+	out, err := net.DialUDP("udp4", nil, dest)
+	if err != nil {
+		log.Printf("flexclient[%s]: local direct assist local UDP dial failed serial=%s dest=%s err=%v",
+			da.routeID, da.serial, dest.String(), err)
+		return
+	}
+	defer out.Close()
+	_ = out.SetWriteBuffer(udpSocketBufferSize)
+
+	queue := make(chan []byte, directAssistQueueSize)
+	go runDirectAssistVITAWriter(da, session, out, queue)
+
+	buf := make([]byte, 8192)
+	for {
+		n, addr, err := session.conn.ReadFromUDP(buf)
+		if err != nil {
+			close(queue)
+			return
+		}
+		if n <= 0 {
+			continue
+		}
+		if addr != nil && addr.IP != nil {
+			radioIP := net.ParseIP(da.radioIP)
+			if radioIP != nil && !addr.IP.Equal(radioIP) {
+				continue
+			}
+		}
+		frame := append([]byte(nil), buf[:n]...)
+		select {
+		case queue <- frame:
+		default:
+			// Keep current display/audio data when the tunnel delivers a burst.
+			select {
+			case <-queue:
+			default:
+			}
+			select {
+			case queue <- frame:
+			default:
+			}
+		}
+	}
+}
+
+func runDirectAssistVITAWriter(da *localDirectAssistListener, session *directAssistVITASession, out *net.UDPConn, queue <-chan []byte) {
+	var lastWrite time.Time
+	for frame := range queue {
+		now := time.Now()
+		if lastWrite.IsZero() || now.Sub(lastWrite) > directAssistIdleReset {
+			select {
+			case <-da.done:
+				return
+			case <-time.After(directAssistPrimeWait):
+			}
+		}
+
+		if _, err := out.Write(frame); err != nil {
+			return
+		}
+		lastWrite = time.Now()
+		logDirectAssistVITA(da, session, len(frame))
+
+		if sleep := directAssistPaceInterval(len(queue)); sleep > 0 {
+			select {
+			case <-da.done:
+				return
+			case <-time.After(sleep):
+			}
+		}
+	}
+}
+
+func directAssistPaceInterval(queued int) time.Duration {
+	switch {
+	case queued > 200:
+		return time.Millisecond
+	case queued > 50:
+		return 2 * time.Millisecond
+	case queued > 5:
+		return 4 * time.Millisecond
+	default:
+		return 0
+	}
+}
+
+func logDirectAssistVITA(da *localDirectAssistListener, session *directAssistVITASession, n int) {
+	if da == nil || session == nil {
+		return
+	}
+	da.mu.Lock()
+	defer da.mu.Unlock()
+	now := time.Now()
+	session.packets++
+	session.lastBytes += uint64(n)
+	if now.Sub(session.lastLog) < 5*time.Second {
+		return
+	}
+	elapsed := now.Sub(session.lastLog).Seconds()
+	if session.lastLog.IsZero() || elapsed <= 0 {
+		elapsed = 5
+	}
+	pps := float64(session.packets) / elapsed
+	log.Printf("flexclient[%s]: local direct assist VITA serial=%s tunnel_udp=%d packets=%d pps=%.1f bytes=%d -> 127.0.0.1:%d",
+		da.routeID, da.serial, session.vitaPort, session.packets, pps, session.lastBytes, session.smartSDRPort)
+	session.packets = 0
+	session.lastBytes = 0
+	session.lastLog = now
+}
+
+func closeAllLocalDirectAssistListeners() {
+	localDirectAssistMu.Lock()
+	defer localDirectAssistMu.Unlock()
+	for serial, da := range localDirectAssistBySerial {
+		closeLocalDirectAssist(da)
+		delete(localDirectAssistBySerial, serial)
+	}
+}
+
+func closeLocalDirectAssist(da *localDirectAssistListener) {
+	if da == nil {
+		return
+	}
+	da.closeOnce.Do(func() {
+		close(da.done)
+		if da.ln != nil {
+			_ = da.ln.Close()
+		}
+		da.mu.Lock()
+		for port, session := range da.vitaBySmartUDP {
+			if session != nil && session.conn != nil {
+				_ = session.conn.Close()
+			}
+			delete(da.vitaBySmartUDP, port)
+		}
+		for _, conn := range da.udpConns {
+			if conn != nil {
+				_ = conn.Close()
+			}
+		}
+		da.mu.Unlock()
+	})
 }
 
 func reserializeVRTWithPayload(v vrt.VRT, payload string) ([]byte, error) {
@@ -917,13 +1420,35 @@ func resetRebroadcastConns() {
 	}
 }
 
+func resetVitaForwardConns() {
+	vitaForwardMu.Lock()
+	defer vitaForwardMu.Unlock()
+	for key, conn := range vitaForwardConn {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		delete(vitaForwardConn, key)
+	}
+}
+
+func resetDirectPunchConns() {
+	directPunchMu.Lock()
+	defer directPunchMu.Unlock()
+	for key, entry := range directPunchConns {
+		if entry != nil && entry.conn != nil {
+			_ = entry.conn.Close()
+		}
+		delete(directPunchConns, key)
+	}
+}
+
 func isLikelyTunnelInterface(name string) bool {
 	n := strings.ToLower(strings.TrimSpace(name))
 	if n == "" {
 		return false
 	}
 	tunnelHints := []string{
-		"netbird", "wt0", "wintun", "wireguard", "wg", "tailscale", "tun", "tap", "utun", "zt",
+		"netbird", "wt0", "wintun", "wireguard", "wg", "tun", "tap", "utun", "zt",
 	}
 	for _, h := range tunnelHints {
 		if strings.Contains(n, h) {
@@ -968,54 +1493,232 @@ func directedBroadcastIPv4(ip net.IP, mask net.IPMask) net.IP {
 }
 
 func forwardVitaPacketToLocal(payload []byte, targetIP net.IP) {
-	if len(payload) < len(vitaProxyPacketMagic)+2 {
+	frame, key, ok := parseVitaForwardFrame(payload, targetIP)
+	if !ok {
 		return
 	}
-	if !bytes.HasPrefix(payload, []byte(vitaProxyPacketMagic)) {
+
+	ch := getVitaForwardQueue(key, frame.destIP, frame.dstPort)
+	select {
+	case ch <- frame:
 		return
+	default:
+		// Prefer current audio over stale queued audio when Windows or the tunnel
+		// delivers VITA in bursts.
+		select {
+		case <-ch:
+		default:
+		}
+		select {
+		case ch <- frame:
+		default:
+		}
+	}
+}
+
+func parseVitaForwardFrame(payload []byte, targetIP net.IP) (vitaForwardFrame, string, bool) {
+	var frame vitaForwardFrame
+	if len(payload) < len(vitaProxyPacketMagic)+2 {
+		return frame, "", false
+	}
+	if !bytes.HasPrefix(payload, []byte(vitaProxyPacketMagic)) {
+		return frame, "", false
 	}
 	offset := len(vitaProxyPacketMagic)
 	dstPort := int(binary.BigEndian.Uint16(payload[offset : offset+2]))
 	if dstPort <= 0 {
-		return
+		return frame, "", false
 	}
 	data := payload[offset+2:]
 	if len(data) == 0 {
-		return
+		return frame, "", false
 	}
-
 	destIP := net.ParseIP("127.0.0.1")
 	if targetIP != nil {
 		if v4 := targetIP.To4(); v4 != nil {
 			destIP = v4
 		}
 	}
+	frame = vitaForwardFrame{
+		destIP:  append(net.IP(nil), destIP...),
+		dstPort: dstPort,
+		data:    append([]byte(nil), data...),
+	}
+	key := destIP.String() + ":" + strconv.Itoa(dstPort)
+	return frame, key, true
+}
+
+func getVitaForwardQueue(key string, destIP net.IP, dstPort int) chan vitaForwardFrame {
+	vitaForwardMu.Lock()
+	defer vitaForwardMu.Unlock()
+	if ch := vitaForwardQueue[key]; ch != nil {
+		return ch
+	}
+	ch := make(chan vitaForwardFrame, vitaForwardQueueSize)
+	vitaForwardQueue[key] = ch
+	go runVitaForwardWorker(key, append(net.IP(nil), destIP...), dstPort, ch)
+	return ch
+}
+
+func runVitaForwardWorker(key string, destIP net.IP, dstPort int, ch <-chan vitaForwardFrame) {
+	var lastFrame time.Time
+	for frame := range ch {
+		now := time.Now()
+		if lastFrame.IsZero() || now.Sub(lastFrame) > vitaForwardIdleReset {
+			time.Sleep(vitaForwardPrimeWait)
+		}
+		lastFrame = time.Now()
+
+		conn, connKey, err := getVitaForwardConn(destIP, dstPort)
+		if err != nil {
+			continue
+		}
+		if _, err := conn.Write(frame.data); err != nil {
+			removeVitaForwardConn(connKey, conn)
+		} else {
+			logVitaForwardedPacket(key, len(frame.data), len(ch))
+		}
+
+		sleep := vitaForwardPaceInterval(len(ch))
+		if sleep > 0 {
+			time.Sleep(sleep)
+		}
+	}
+}
+
+func logVitaForwardedPacket(key string, payloadLen int, queued int) {
+	vitaForwardLogMu.Lock()
+	defer vitaForwardLogMu.Unlock()
+
+	now := time.Now()
+	vitaForwardCount[key]++
+	if lastWrite := vitaForwardLastWrite[key]; !lastWrite.IsZero() {
+		if gap := now.Sub(lastWrite); gap > vitaForwardMaxGap[key] {
+			vitaForwardMaxGap[key] = gap
+		}
+	}
+	vitaForwardLastWrite[key] = now
+
+	lastLog := vitaForwardLastLog[key]
+	if now.Sub(lastLog) < 5*time.Second {
+		return
+	}
+	elapsed := now.Sub(lastLog).Seconds()
+	if lastLog.IsZero() || elapsed <= 0 {
+		elapsed = 5
+	}
+	total := vitaForwardCount[key]
+	intervalPackets := total - vitaForwardLastCount[key]
+	pps := float64(intervalPackets) / elapsed
+	maxGap := vitaForwardMaxGap[key]
+
+	vitaForwardLastLog[key] = now
+	vitaForwardLastCount[key] = total
+	vitaForwardMaxGap[key] = 0
+
+	log.Printf("flexclient: forwarded VITA local -> %s (payload=%d bytes, total=%d, pps=%.1f, max_gap=%s, queued=%d)",
+		key, payloadLen, total, pps, maxGap.Truncate(time.Millisecond), queued)
+}
+
+func vitaForwardPaceInterval(queued int) time.Duration {
+	switch {
+	case queued > 300:
+		return time.Millisecond
+	case queued > 100:
+		return 2 * time.Millisecond
+	case queued > 20:
+		return 4 * time.Millisecond
+	default:
+		return 4900 * time.Microsecond
+	}
+}
+
+func removeVitaForwardConn(key string, conn *net.UDPConn) {
+	if conn == nil {
+		return
+	}
+	vitaForwardMu.Lock()
+	if current := vitaForwardConn[key]; current == conn {
+		delete(vitaForwardConn, key)
+	}
+	vitaForwardMu.Unlock()
+	_ = conn.Close()
+}
+
+func getVitaForwardConn(destIP net.IP, dstPort int) (*net.UDPConn, string, error) {
+	if destIP == nil || dstPort <= 0 || dstPort >= 65536 {
+		return nil, "", fmt.Errorf("invalid VITA forward destination")
+	}
+	key := destIP.String() + ":" + strconv.Itoa(dstPort)
+
+	vitaForwardMu.Lock()
+	defer vitaForwardMu.Unlock()
+	if conn := vitaForwardConn[key]; conn != nil {
+		return conn, key, nil
+	}
+
 	dest := &net.UDPAddr{IP: destIP, Port: dstPort}
 	conn, err := net.DialUDP("udp", nil, dest)
 	if err != nil {
-		return
+		return nil, key, err
 	}
-	defer conn.Close()
-	_, _ = conn.Write(data)
+	_ = conn.SetWriteBuffer(udpSocketBufferSize)
+	vitaForwardConn[key] = conn
+	return conn, key, nil
 }
 
 func logVitaPacket(routeID string, dstPort int, payloadLen int, targetIP net.IP) {
 	vitaLogMu.Lock()
 	defer vitaLogMu.Unlock()
 
-	vitaCountByID[routeID]++
 	now := time.Now()
+	vitaCountByID[routeID]++
+	vitaBytesByID[routeID] += uint64(payloadLen)
+	if lastPacket := vitaLastPacketByID[routeID]; !lastPacket.IsZero() {
+		if gap := now.Sub(lastPacket); gap > vitaMaxGapByID[routeID] {
+			vitaMaxGapByID[routeID] = gap
+		}
+	}
+	vitaLastPacketByID[routeID] = now
+
 	last := vitaLastLogByID[routeID]
 	if now.Sub(last) < 5*time.Second {
 		return
 	}
+	elapsed := now.Sub(last).Seconds()
+	if last.IsZero() || elapsed <= 0 {
+		elapsed = 5
+	}
+	totalPackets := vitaCountByID[routeID]
+	totalBytes := vitaBytesByID[routeID]
+	intervalPackets := totalPackets - vitaLastLogCountByID[routeID]
+	intervalBytes := totalBytes - vitaLastLogBytesByID[routeID]
+	pps := float64(intervalPackets) / elapsed
+	maxGap := vitaMaxGapByID[routeID]
 	vitaLastLogByID[routeID] = now
+	vitaLastLogCountByID[routeID] = totalPackets
+	vitaLastLogBytesByID[routeID] = totalBytes
+	vitaMaxGapByID[routeID] = 0
+
 	target := "127.0.0.1"
 	if targetIP != nil {
 		target = targetIP.String()
 	}
-	log.Printf("flexclient[%s]: received VITA proxy packet -> %s:%d (payload=%d bytes, total=%d)",
-		routeID, target, dstPort, payloadLen, vitaCountByID[routeID])
+	log.Printf("flexclient[%s]: received VITA proxy packet -> %s:%d (payload=%d bytes, total=%d, pps=%.1f, bytes=%d, max_gap=%s)",
+		routeID, target, dstPort, payloadLen, totalPackets, pps, intervalBytes, maxGap.Truncate(time.Millisecond))
+}
+
+func shouldLogDiscoveryRewrite(routeID, serial string) bool {
+	key := routeID + "|" + strings.ToLower(strings.TrimSpace(serial))
+	now := time.Now()
+
+	discoveryLogMu.Lock()
+	defer discoveryLogMu.Unlock()
+	if now.Sub(discoveryLastLog[key]) < 10*time.Second {
+		return false
+	}
+	discoveryLastLog[key] = now
+	return true
 }
 
 func applyDiscoveryModeAndBroadcast(
@@ -1033,36 +1736,36 @@ func applyDiscoveryModeAndBroadcast(
 		mode = radioModeForSerial(serial)
 	}
 
-	// No auto-switching:
-	// - off mode: do not rebroadcast this radio
-	// - direct mode: rebroadcast original discovery
-	// - proxy mode: rewrite radio endpoint to server proxy endpoint
 	if mode == radioModeOff {
 		return
 	}
 
-	if serial != "" && mode == radioModeProxy {
-		localIP, err := ensureLocalProxyListener(serial, routeID, serverIP)
-		if err != nil {
-			log.Printf("flexclient[%s]: local proxy listener setup failed serial=%s: %v", routeID, serial, err)
-			rebroadcastDiscoveryPacket(payload)
-			return
-		}
-
-		rewritten, _, err := rewriteDiscoveryForProxy(payload, localIP, broadcastPort)
-		if err == nil {
-			if logRewrite && discoveryText != "" {
-				origIP := fieldValue(discoveryText, "ip")
-				origPort := fieldValue(discoveryText, "port")
-				origNick := fieldValue(discoveryText, "nickname")
-				origCall := fieldValue(discoveryText, "callsign")
-				log.Printf("flexclient[%s]: proxy rewrite serial=%s %s:%s -> %s:%d",
-					routeID, serial, origIP, origPort, localIP, broadcastPort)
-				log.Printf("flexclient[%s]: identity serial=%s nickname=%q callsign=%q",
-					routeID, serial, origNick, origCall)
+	if mode == radioModeDirect {
+		maybeSendDirectRadioPunch(routeID, serial, clientIP, payload, discoveryText)
+		if directAssistEnabled() && serial != "" {
+			if strings.TrimSpace(discoveryText) == "" {
+				if _, text, err := extractDiscoveryText(payload); err == nil {
+					discoveryText = text
+				}
 			}
-			rebroadcastDiscoveryPacket(rewritten)
-			return
+			radioIP := strings.TrimSpace(fieldValue(discoveryText, "ip"))
+			radioPort := broadcastPort
+			if raw := strings.TrimSpace(fieldValue(discoveryText, "port")); raw != "" {
+				if p, err := strconv.Atoi(raw); err == nil && p > 0 && p < 65536 {
+					radioPort = p
+				}
+			}
+			localIP, err := ensureLocalDirectAssistListener(serial, routeID, clientIP, radioIP, radioPort)
+			if err != nil {
+				log.Printf("flexclient[%s]: local direct assist setup failed serial=%s: %v", routeID, serial, err)
+			} else if rewritten, _, err := rewriteDiscoveryForProxy(payload, localIP, broadcastPort); err == nil {
+				if logRewrite && discoveryText != "" && shouldLogDiscoveryRewrite(routeID, serial) {
+					log.Printf("flexclient[%s]: direct assist rewrite serial=%s %s:%d -> %s:%d",
+						routeID, serial, radioIP, radioPort, localIP, broadcastPort)
+				}
+				rebroadcastDiscoveryPacket(rewritten)
+				return
+			}
 		}
 	}
 
@@ -1109,6 +1812,8 @@ func runForServer(ctx context.Context, route Route, version string) {
 		log.Printf("flexclient[%s]: DialUDP to server %s failed: %v", route.ID, serverAddr.String(), err)
 		return
 	}
+	_ = conn.SetReadBuffer(udpSocketBufferSize)
+	_ = conn.SetWriteBuffer(udpSocketBufferSize)
 	defer conn.Close()
 
 	localAddr := conn.LocalAddr().(*net.UDPAddr)

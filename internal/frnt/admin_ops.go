@@ -37,10 +37,12 @@ type adminFlexToolConfig struct {
 	NetBirdAPIURL         string
 	DiscoveryDelaySeconds int
 	SyncIntervalSeconds   int
+	ClientAuthMode        string
 	IgnoreRadios          string
 	EnableVitaProxy       bool
 	VitaProxyPort         int
 	ProxyBasePort         int
+	ProxyLANSourceIPs     string
 	MultiProxy            bool
 }
 
@@ -201,11 +203,10 @@ func renderFlexToolConfig(cfg adminFlexToolConfig) string {
 		fmt.Sprintf("NETBIRD_API_URL=%s", envQuote(cfg.NetBirdAPIURL)),
 		fmt.Sprintf("DISCOVERY_DELAY_SECONDS=%d", cfg.DiscoveryDelaySeconds),
 		fmt.Sprintf("SYNC_INTERVAL_SECONDS=%d", cfg.SyncIntervalSeconds),
+		fmt.Sprintf("CLIENT_AUTH_MODE=%s", strings.TrimSpace(cfg.ClientAuthMode)),
 		fmt.Sprintf("IGNORE_RADIOS=%s", strings.TrimSpace(cfg.IgnoreRadios)),
 		fmt.Sprintf("ENABLE_VITA_PROXY=%s", boolToLower(cfg.EnableVitaProxy)),
 		fmt.Sprintf("VITA_PROXY_PORT=%d", cfg.VitaProxyPort),
-		fmt.Sprintf("PROXY_BASE_PORT=%d", cfg.ProxyBasePort),
-		fmt.Sprintf("MULTI_PROXY=%s", boolToLower(cfg.MultiProxy)),
 	}
 	return strings.Join(lines, "\n") + "\n"
 }
@@ -536,6 +537,8 @@ func parseFlexToolConfig(content string, base adminFlexToolConfig) adminFlexTool
 			if n, err := strconv.Atoi(val); err == nil && n >= 0 {
 				cfg.SyncIntervalSeconds = n
 			}
+		case "CLIENT_AUTH_MODE":
+			cfg.ClientAuthMode = val
 		case "IGNORE_RADIOS":
 			cfg.IgnoreRadios = val
 		case "ENABLE_VITA_PROXY":
@@ -548,6 +551,8 @@ func parseFlexToolConfig(content string, base adminFlexToolConfig) adminFlexTool
 			if n, err := strconv.Atoi(val); err == nil && n > 0 {
 				cfg.ProxyBasePort = n
 			}
+		case "PROXY_LAN_SOURCE_IPS":
+			cfg.ProxyLANSourceIPs = val
 		case "MULTI_PROXY":
 			cfg.MultiProxy = strings.EqualFold(val, "true")
 		}

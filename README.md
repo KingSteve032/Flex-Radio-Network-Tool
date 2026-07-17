@@ -40,48 +40,71 @@ SYNC_INTERVAL_SECONDS=60
 - Any value `> 0` runs an initial sync at startup and repeats at that interval.
 - Requires `NETBIRD_API_TOKEN` and `NETBIRD_API_URL` in `.flextool`.
 
-### Per-Radio Proxy vs Direct (No Auto-Swap)
+### Registered-Client Mode
 
-The client now supports explicit per-radio mode selection:
+For deployments where the server should not look up NetBird users, set:
 
-- `direct`: keep existing behavior (discovery rebroadcast as-is)
-- `proxy`: rewrite that radio's discovery endpoint so SmartSDR connects through the Flextool server proxy path
+```env
+CLIENT_AUTH_MODE=registered
+SYNC_INTERVAL_SECONDS=0
+```
 
-There is no automatic fallback/swap between modes.
+In this mode FRNT trusts live flexclient `HELLO` registrations that arrive on
+the VPN-facing interface. Discovery and VITA packets are sent only to currently
+registered clients, and the NetBird SQLite user table/API sync is not required.
+
+The default remains:
+
+```env
+CLIENT_AUTH_MODE=db
+```
+
+which preserves the existing NetBird user database authorization behavior.
+
+On Windows clients that are not using NetBird route discovery, set the FRNT
+server IP(s) explicitly:
+
+```env
+FLEXCLIENT_ROUTES=Chesapeake=100.64.0.4
+FLEXCLIENT_SKIP_VPN_STATUS=true
+```
+
+Multiple servers can be comma-separated:
+
+```env
+FLEXCLIENT_ROUTES=Chesapeake=100.64.0.4,W4CAR=100.64.0.5
+```
+
+`FLEXCLIENT_SKIP_VPN_STATUS=true` disables the GUI startup check that normally
+runs `netbird status`.
+
+The Windows GUI also exposes these as Settings:
+
+- `Route Source`: choose `NetBird routes` or `Manual FRNT servers`
+- `FRNT Servers`: optional manual server routes, one per line, for example `Chesapeake=100.64.0.2`
+
+After clicking `Save + Apply`, the Flexclient page will connect to those FRNT
+servers and the route cards will show radios discovered through them.
+
+### Per-Radio On/Off
+
+The client now supports explicit per-radio enable/disable selection:
+
+- `on`: rewrite discovery to the local direct-assist endpoint
+- `off`: hide that radio from local SmartSDR discovery
 
 #### Client Setting
 
 Set `FLEXCLIENT_RADIO_MODES` on the client:
 
 ```env
-FLEXCLIENT_RADIO_MODES=SERIAL1=proxy,SERIAL2=direct
+FLEXCLIENT_RADIO_MODES=SERIAL1=on,SERIAL2=off
 ```
 
-- Any radio not listed defaults to `direct`.
+- Any radio not listed defaults to `on`.
 - Mode keys are compared case-insensitively.
-
-Optional client setting:
-
-```env
-FLEXCLIENT_PROXY_BASE_PORT=30000
-```
-
-This base is used to derive deterministic per-radio proxy TCP ports from serials.
-
-#### Server Settings
-
-In server `.flextool`:
-
-```env
-ENABLE_VITA_PROXY=true
-VITA_PROXY_PORT=4991
-PROXY_BASE_PORT=30000
-MULTI_PROXY=true
-```
-
-- `ENABLE_VITA_PROXY=true` enables the VITA relay path.
-- `PROXY_BASE_PORT` must match client `FLEXCLIENT_PROXY_BASE_PORT` to keep per-radio proxy port mapping aligned.
-- `MULTI_PROXY=true` allows one client to keep simultaneous proxy sessions to multiple radios.
+Legacy `direct` and `proxy` values are treated as `on` when read from older
+settings files.
 
 ## Platform Notes
 

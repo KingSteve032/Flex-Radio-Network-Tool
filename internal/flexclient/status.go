@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -27,6 +28,17 @@ type RouteRadioStatus struct {
 //
 // This lets the GUI block "Start" until NetBird is connected.
 func CheckNetbirdStatus(timeout time.Duration) (connected bool, needsLogin bool, raw string, err error) {
+	mode, manualRoutes := GetVPNModeSettings()
+	if mode == VPNModeManual || len(manualRoutes) > 0 {
+		log.Printf("flexclient: VPN status check skipped for manual FRNT server routes")
+		return true, false, "VPN status check skipped for manual FRNT server routes", nil
+	}
+
+	if shouldSkipVPNStatusCheck() {
+		log.Printf("flexclient: VPN status check skipped by configuration")
+		return true, false, "VPN status check skipped", nil
+	}
+
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
@@ -66,6 +78,16 @@ func CheckNetbirdStatus(timeout time.Duration) (connected bool, needsLogin bool,
 	// Any other situation is treated as not connected.
 	log.Printf("flexclient: netbird status -> not connected, output:\n%s", raw)
 	return false, false, raw, nil
+}
+
+func shouldSkipVPNStatusCheck() bool {
+	for _, name := range []string{"FLEXCLIENT_SKIP_VPN_STATUS", "FRNT_SKIP_VPN_STATUS"} {
+		switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+		case "1", "true", "yes", "y", "on":
+			return true
+		}
+	}
+	return false
 }
 
 // GetRouteStatus returns how long ago we saw:

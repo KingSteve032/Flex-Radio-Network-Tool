@@ -481,8 +481,9 @@ func Run() {
 	var menu *widget.List
 	var refreshMenuItems func()
 
-	// Load saved proxy/direct settings if present.
+	// Load saved client settings if present.
 	if persisted, err := loadProxySettingsFromDisk(); err == nil {
+		flexclient.SetVPNModeSettings(persisted.VPNMode, manualRoutesFromSettings(persisted.ManualRoutes))
 		flexclient.SetRadioModeSettings(persisted.ProxyBasePort, persisted.RadioModes)
 		ignoredRoutes := map[string]bool{}
 		for _, routeID := range persisted.IgnoredRoutes {
@@ -493,13 +494,14 @@ func Run() {
 			ignoredRoutes[routeID] = true
 		}
 		flexclient.SetIgnoredRoutes(ignoredRoutes)
-		log.Printf("GUI: loaded proxy settings from %s", clientSettingsPath())
+		log.Printf("GUI: loaded client settings from %s", clientSettingsPath())
 	} else {
-		log.Printf("GUI: proxy settings file not loaded (%v), using env/defaults", err)
+		log.Printf("GUI: client settings file not loaded (%v), using env/defaults", err)
 	}
 
 	persistRuntimeSettings := func() error {
-		basePort, modes := flexclient.GetRadioModeSettings()
+		vpnMode, manualRoutes := flexclient.GetVPNModeSettings()
+		_, modes := flexclient.GetRadioModeSettings()
 		ignoredMap := flexclient.GetIgnoredRoutes()
 		ignoredRoutes := make([]string, 0, len(ignoredMap))
 		for routeID, ignored := range ignoredMap {
@@ -508,7 +510,8 @@ func Run() {
 			}
 		}
 		return saveProxySettingsToDisk(proxySettingsFile{
-			ProxyBasePort: basePort,
+			VPNMode:       vpnMode,
+			ManualRoutes:  manualRoutesToSettings(manualRoutes),
 			RadioModes:    modes,
 			IgnoredRoutes: ignoredRoutes,
 		})
@@ -584,28 +587,36 @@ func Run() {
 							fmt.Sprintf("Radio %s - %s (%s ago, packets=%d)", radio.Serial, radioState, age, radio.PacketSeen),
 						)
 
-						modeRadio := widget.NewRadioGroup([]string{"direct", "proxy", "off"}, nil)
+						modeRadio := widget.NewRadioGroup([]string{"on", "off"}, nil)
 						modeRadio.Horizontal = true
-						modeRadio.SetSelected(flexclient.GetRadioMode(radio.Serial))
+						selected := "on"
+						if flexclient.GetRadioMode(radio.Serial) == "off" {
+							selected = "off"
+						}
+						modeRadio.SetSelected(selected)
 
 						serial := radio.Serial
 						modeRadio.OnChanged = func(mode string) {
 							if mode == "" {
 								return
 							}
-							flexclient.SetRadioModeForSerial(serial, mode)
+							flexMode := "direct"
+							if mode == "off" {
+								flexMode = "off"
+							}
+							flexclient.SetRadioModeForSerial(serial, flexMode)
 							if err := persistRuntimeSettings(); err != nil {
 								log.Printf("GUI: failed to persist per-radio mode change for %s: %v", serial, err)
 								return
 							}
-							log.Printf("GUI: set radio %s mode=%s", serial, mode)
+							log.Printf("GUI: set radio %s enabled=%v", serial, mode == "on")
 						}
 
 						radioRow := container.NewHBox(
 							layout.NewSpacer(),
 							radioLabel,
 							layout.NewSpacer(),
-							widget.NewLabel("Mode"),
+							widget.NewLabel("Radio"),
 							modeRadio,
 						)
 						cardBody = append(cardBody, radioRow)
@@ -765,27 +776,43 @@ func Run() {
 	flexclientPage := container.NewBorder(flexclientTopBar, nil, nil, nil, routeCardsScroll)
 
 	// ---------- Settings page ----------
-	proxyBasePort, radioModes := flexclient.GetRadioModeSettings()
+	routeMode, manualRoutes := flexclient.GetVPNModeSettings()
+	_, radioModes := flexclient.GetRadioModeSettings()
 
-	proxyBasePortEntry := widget.NewEntry()
-	proxyBasePortEntry.SetText(fmt.Sprintf("%d", proxyBasePort))
-	proxyBasePortEntry.SetPlaceHolder("30000")
+	const routeSourceNetBird = "NetBird routes"
+	const routeSourceManual = "Manual FRNT servers"
+
+	routeSourceSelect := widget.NewSelect([]string{routeSourceNetBird, routeSourceManual}, nil)
+	routeSourceSelect.SetSelected(routeSourceNetBird)
+	if routeMode == flexclient.VPNModeManual || len(manualRoutes) > 0 {
+		routeSourceSelect.SetSelected(routeSourceManual)
+	}
+
+	manualRoutesEntry := widget.NewMultiLineEntry()
+	manualRoutesEntry.SetPlaceHolder("Chesapeake=100.64.0.2\nW4CAR=100.64.0.5")
+	manualRoutesEntry.SetMinRowsVisible(5)
+	manualRoutesEntry.SetText(flexclient.FormatManualRoutesText(manualRoutes))
+
+	updateManualRoutesState := func() {
+		if routeSourceSelect.Selected == routeSourceManual {
+			manualRoutesEntry.Enable()
+		} else {
+			manualRoutesEntry.Disable()
+		}
+	}
+	routeSourceSelect.OnChanged = func(string) {
+		updateManualRoutesState()
+	}
+	updateManualRoutesState()
 
 	radioModesEntry := widget.NewMultiLineEntry()
-	radioModesEntry.SetPlaceHolder("serial=proxy\nanother-serial=direct\nthird-serial=off")
+	radioModesEntry.SetPlaceHolder("serial=on\nanother-serial=off")
 	radioModesEntry.SetMinRowsVisible(14)
 	radioModesEntry.SetText(formatRadioModesText(radioModes))
 
 	settingsStatus := widget.NewLabel("Edit settings and click Save + Apply.")
 
 	saveApplyBtn := widget.NewButton("Save + Apply", func() {
-		basePort, err := parseProxyBasePort(proxyBasePortEntry.Text)
-		if err != nil {
-			settingsStatus.SetText("Error: " + err.Error())
-			dialog.ShowError(err, w)
-			return
-		}
-
 		modes, err := parseRadioModesText(radioModesEntry.Text)
 		if err != nil {
 			settingsStatus.SetText("Error: " + err.Error())
@@ -793,7 +820,26 @@ func Run() {
 			return
 		}
 
-		flexclient.SetRadioModeSettings(basePort, modes)
+		vpnMode := flexclient.VPNModeNetBird
+		var manualRoutes []flexclient.ManualRoute
+		if routeSourceSelect.Selected == routeSourceManual {
+			manualRoutes, err = flexclient.ParseManualRoutesText(manualRoutesEntry.Text)
+			if err != nil {
+				settingsStatus.SetText("Error: " + err.Error())
+				dialog.ShowError(err, w)
+				return
+			}
+			if len(manualRoutes) == 0 {
+				err := fmt.Errorf("manual FRNT server mode needs at least one server route")
+				settingsStatus.SetText("Error: " + err.Error())
+				dialog.ShowError(err, w)
+				return
+			}
+			vpnMode = flexclient.VPNModeManual
+		}
+
+		flexclient.SetVPNModeSettings(vpnMode, manualRoutes)
+		flexclient.SetRadioModeSettings(0, modes)
 		if err := persistRuntimeSettings(); err != nil {
 			settingsStatus.SetText("Applied in memory, but save failed: " + err.Error())
 			dialog.ShowError(err, w)
@@ -801,7 +847,7 @@ func Run() {
 		}
 
 		settingsStatus.SetText("Saved and applied.")
-		log.Printf("GUI: proxy settings saved/applied (%d radios)", len(modes))
+		log.Printf("GUI: settings saved/applied (route_mode=%s, routes=%d, radios=%d)", vpnMode, len(manualRoutes), len(modes))
 	})
 
 	reloadBtn := widget.NewButton("Reload Saved", func() {
@@ -812,6 +858,7 @@ func Run() {
 			return
 		}
 
+		flexclient.SetVPNModeSettings(cfg.VPNMode, manualRoutesFromSettings(cfg.ManualRoutes))
 		flexclient.SetRadioModeSettings(cfg.ProxyBasePort, cfg.RadioModes)
 		ignoredRoutes := map[string]bool{}
 		for _, routeID := range cfg.IgnoredRoutes {
@@ -822,25 +869,40 @@ func Run() {
 			ignoredRoutes[routeID] = true
 		}
 		flexclient.SetIgnoredRoutes(ignoredRoutes)
-		proxyBasePortEntry.SetText(fmt.Sprintf("%d", cfg.ProxyBasePort))
+		routeModeRuntime, manualRoutesRuntime := flexclient.GetVPNModeSettings()
+		if routeModeRuntime == flexclient.VPNModeManual || len(manualRoutesRuntime) > 0 {
+			routeSourceSelect.SetSelected(routeSourceManual)
+		} else {
+			routeSourceSelect.SetSelected(routeSourceNetBird)
+		}
+		manualRoutesEntry.SetText(flexclient.FormatManualRoutesText(manualRoutesRuntime))
 		radioModesEntry.SetText(formatRadioModesText(cfg.RadioModes))
 		settingsStatus.SetText("Reloaded saved settings.")
 	})
 
 	readRuntimeBtn := widget.NewButton("Load Current Runtime", func() {
-		base, modes := flexclient.GetRadioModeSettings()
-		proxyBasePortEntry.SetText(fmt.Sprintf("%d", base))
+		routeMode, manualRoutes := flexclient.GetVPNModeSettings()
+		_, modes := flexclient.GetRadioModeSettings()
+		if routeMode == flexclient.VPNModeManual || len(manualRoutes) > 0 {
+			routeSourceSelect.SetSelected(routeSourceManual)
+		} else {
+			routeSourceSelect.SetSelected(routeSourceNetBird)
+		}
+		manualRoutesEntry.SetText(flexclient.FormatManualRoutesText(manualRoutes))
 		radioModesEntry.SetText(formatRadioModesText(modes))
 		settingsStatus.SetText("Loaded current runtime settings.")
 	})
 
 	settingsForm := widget.NewForm(
-		widget.NewFormItem("Proxy Base Port", proxyBasePortEntry),
+		widget.NewFormItem("Route Source", routeSourceSelect),
+		widget.NewFormItem("FRNT Servers", manualRoutesEntry),
 	)
 
 	settingsHelp := widget.NewLabel(
-		"Per radio mode (one per line): serial=direct, serial=proxy, or serial=off.\n" +
-			"Modes are explicit only. Unlisted radios stay direct.",
+		"NetBird routes discovers FRNT servers automatically. Manual FRNT servers use one line per server: name=ip.\n" +
+			"Example: Chesapeake=100.64.0.2\n" +
+			"Per radio setting (one per line): serial=on or serial=off.\n" +
+			"Unlisted radios stay on and use direct assist.",
 	)
 
 	settingsPage := container.NewBorder(
@@ -1116,18 +1178,17 @@ func Run() {
 			"- Stop: disconnects all route workers.\n" +
 			"- Show Radios: expands a route card to list radios seen on that route.\n" +
 			"- Ignore FlexTool: hides all radios from that route from local discovery.\n\n" +
-			"Per-Radio Mode\n" +
-			"- direct: SmartSDR connects to the discovered radio endpoint directly.\n" +
-			"- proxy: discovery is rewritten so SmartSDR connects through the FRNT server.\n" +
+			"Per-Radio Switch\n" +
+			"- on: SmartSDR connects through the local direct-assist endpoint.\n" +
 			"- off: this radio is ignored and not shown to SmartSDR.\n\n" +
 			"Settings Page\n" +
-			"- Proxy Base Port: base used for per-radio proxy listeners.\n" +
-			"- Radio Modes: optional serial=mode overrides (direct/proxy/off).\n" +
+			"- FRNT Servers: optional manual FRNT server routes, one per line.\n" +
+			"- Radio Settings: optional serial=on/off overrides.\n" +
 			"- Save + Apply writes settings to flexclient-settings.json and applies immediately.\n\n" +
 			"Quick Troubleshooting\n" +
 			"- If Start fails, check NetBird login/management connectivity.\n" +
-			"- If radios are missing, verify route is not ignored and radio mode is not off.\n" +
-			"- If proxy fails, confirm server service is active and firewall rule is OK on About page.\n" +
+			"- If radios are missing, verify route is not ignored and the radio switch is on.\n" +
+			"- If audio is missing, confirm DAX/CAT are attached after SmartSDR connects.\n" +
 			"- Logs are written to flexclient-gui.log next to frnt.exe.",
 	)
 	helpText.Wrapping = fyne.TextWrapWord
@@ -1221,6 +1282,9 @@ func Run() {
 	adminSyncInterval := widget.NewEntry()
 	adminSyncInterval.SetText("60")
 
+	adminClientAuthMode := widget.NewSelect([]string{"db", "registered"}, nil)
+	adminClientAuthMode.SetSelected("db")
+
 	adminIgnoreRadios := widget.NewEntry()
 	adminIgnoreRadios.SetPlaceHolder("comma-separated IPs (optional)")
 
@@ -1229,12 +1293,6 @@ func Run() {
 
 	adminVitaPort := widget.NewEntry()
 	adminVitaPort.SetText("4991")
-
-	adminProxyBasePort := widget.NewEntry()
-	adminProxyBasePort.SetText("30000")
-
-	adminMultiProxy := widget.NewCheck("", nil)
-	adminMultiProxy.SetChecked(true)
 
 	adminLog := widget.NewMultiLineEntry()
 	adminLog.SetMinRowsVisible(22)
@@ -1273,11 +1331,7 @@ func Run() {
 		if err != nil {
 			return adminFlexToolConfig{}, err
 		}
-		vitaPort, err := parsePositiveIntField("VITA Proxy Port", adminVitaPort.Text)
-		if err != nil {
-			return adminFlexToolConfig{}, err
-		}
-		proxyBase, err := parsePositiveIntField("Proxy Base Port", adminProxyBasePort.Text)
+		vitaPort, err := parsePositiveIntField("VITA Port", adminVitaPort.Text)
 		if err != nil {
 			return adminFlexToolConfig{}, err
 		}
@@ -1290,11 +1344,12 @@ func Run() {
 			NetBirdAPIURL:         strings.TrimSpace(adminAPIURL.Text),
 			DiscoveryDelaySeconds: discoveryDelay,
 			SyncIntervalSeconds:   syncInterval,
+			ClientAuthMode:        strings.TrimSpace(adminClientAuthMode.Selected),
 			IgnoreRadios:          strings.TrimSpace(adminIgnoreRadios.Text),
 			EnableVitaProxy:       adminEnableVita.Checked,
 			VitaProxyPort:         vitaPort,
-			ProxyBasePort:         proxyBase,
-			MultiProxy:            adminMultiProxy.Checked,
+			ProxyBasePort:         30000,
+			MultiProxy:            false,
 		}, nil
 	}
 
@@ -1307,11 +1362,14 @@ func Run() {
 		adminAPIURL.SetText(cfg.NetBirdAPIURL)
 		adminDiscoveryDelay.SetText(strconv.Itoa(cfg.DiscoveryDelaySeconds))
 		adminSyncInterval.SetText(strconv.Itoa(cfg.SyncIntervalSeconds))
+		if strings.TrimSpace(cfg.ClientAuthMode) == "" {
+			adminClientAuthMode.SetSelected("db")
+		} else {
+			adminClientAuthMode.SetSelected(strings.TrimSpace(cfg.ClientAuthMode))
+		}
 		adminIgnoreRadios.SetText(cfg.IgnoreRadios)
 		adminEnableVita.SetChecked(cfg.EnableVitaProxy)
 		adminVitaPort.SetText(strconv.Itoa(cfg.VitaProxyPort))
-		adminProxyBasePort.SetText(strconv.Itoa(cfg.ProxyBasePort))
-		adminMultiProxy.SetChecked(cfg.MultiProxy)
 	}
 
 	buildAdminRequest := func(applyConfig, runInstall, installService, restartService bool, installCommandOverride string) (adminBatchRequest, error) {
@@ -1535,11 +1593,10 @@ func Run() {
 		widget.NewFormItem("NETBIRD_API_URL", adminAPIURL),
 		widget.NewFormItem("DISCOVERY_DELAY_SECONDS", adminDiscoveryDelay),
 		widget.NewFormItem("SYNC_INTERVAL_SECONDS", adminSyncInterval),
+		widget.NewFormItem("CLIENT_AUTH_MODE", adminClientAuthMode),
 		widget.NewFormItem("IGNORE_RADIOS", adminIgnoreRadios),
-		widget.NewFormItem("ENABLE_VITA_PROXY", adminEnableVita),
-		widget.NewFormItem("VITA_PROXY_PORT", adminVitaPort),
-		widget.NewFormItem("PROXY_BASE_PORT", adminProxyBasePort),
-		widget.NewFormItem("MULTI_PROXY", adminMultiProxy),
+		widget.NewFormItem("ENABLE_VITA_FORWARD", adminEnableVita),
+		widget.NewFormItem("VITA_PORT", adminVitaPort),
 	)
 
 	adminActions := container.NewVBox(

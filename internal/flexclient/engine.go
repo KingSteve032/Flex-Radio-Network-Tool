@@ -40,7 +40,7 @@ func Start(ctx context.Context, version string, startupResult chan<- error) {
 	if len(routesFound) == 0 {
 		log.Printf("flexclient: no Flextool routes found, nothing to do")
 		clearState()
-		notifyStartup(fmt.Errorf("no Flextool routes found in NetBird routes list"))
+		notifyStartup(fmt.Errorf("no Flextool routes found"))
 		return
 	}
 

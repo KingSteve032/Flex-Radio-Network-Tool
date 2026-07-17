@@ -63,6 +63,12 @@ func TestBuildConfigApplyCommandInstallsSystemConfig(t *testing.T) {
 			t.Fatalf("config apply command missing %q\n%s", want, cmd)
 		}
 	}
+
+	for _, oldProxyKey := range []string{"PROXY_BASE_PORT", "PROXY_LAN_SOURCE_IPS", "MULTI_PROXY"} {
+		if strings.Contains(cmd, oldProxyKey) {
+			t.Fatalf("config apply command still writes old proxy key %q\n%s", oldProxyKey, cmd)
+		}
+	}
 }
 
 func TestBuildInstallServiceCommandLoadsSystemConfig(t *testing.T) {

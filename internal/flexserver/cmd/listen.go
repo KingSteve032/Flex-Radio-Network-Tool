@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -38,9 +39,11 @@ func ViperValidateListenConfigOptions(mode string, c *viper.Viper) (co utils.Con
 	flag_bpffilter := c.GetString("filter")
 	delay := c.GetInt("DISCOVERY_DELAY_SECONDS")
 	syncIntervalSeconds := c.GetInt("SYNC_INTERVAL_SECONDS")
+	clientAuthMode := c.GetString("CLIENT_AUTH_MODE")
 	enableVitaProxy := c.GetBool("ENABLE_VITA_PROXY")
 	vitaProxyPort := c.GetInt("VITA_PROXY_PORT")
 	proxyBasePort := c.GetInt("PROXY_BASE_PORT")
+	proxyLANSourceIPsRaw := c.GetString("PROXY_LAN_SOURCE_IPS")
 	multiProxy := c.GetBool("MULTI_PROXY")
 
 	co = utils.ConfigOptions{}
@@ -62,6 +65,7 @@ func ViperValidateListenConfigOptions(mode string, c *viper.Viper) (co utils.Con
 	co.EnableBroadcast = flag_broadcast
 	co.EnableDebug = flag_debug
 	co.DiscoveryDelaySeconds = delay
+	co.ClientAuthMode = utils.NormalizeClientAuthMode(clientAuthMode)
 	if syncIntervalSeconds < 0 {
 		return utils.ConfigOptions{}, fmt.Errorf("SYNC_INTERVAL_SECONDS must be 0 or greater")
 	}
@@ -72,6 +76,11 @@ func ViperValidateListenConfigOptions(mode string, c *viper.Viper) (co utils.Con
 		proxyBasePort = 30000
 	}
 	co.ProxyBasePort = proxyBasePort
+	proxyLANSourceIPs, err := parseProxyLANSourceIPs(proxyLANSourceIPsRaw)
+	if err != nil {
+		return utils.ConfigOptions{}, err
+	}
+	co.ProxyLANSourceIPs = proxyLANSourceIPs
 
 	if vitaProxyPort == 0 {
 		vitaProxyPort = defaultVitaProxyPort
@@ -118,16 +127,54 @@ func ViperValidateListenConfigOptions(mode string, c *viper.Viper) (co utils.Con
 		fmt.Println("Listening on interface:", co.ListenInterface)
 		fmt.Println("Sending on interface:", co.SendNetworkInterface.Name, co.SendNetworkInterface.IPAddress)
 		fmt.Println("Discovery delay:", co.DiscoveryDelaySeconds, "seconds")
+		fmt.Println("Client auth mode:", co.ClientAuthMode)
 		fmt.Println("Sync interval:", co.SyncIntervalSeconds, "seconds")
 		fmt.Println("VITA proxy enabled:", co.EnableVitaProxy)
-		fmt.Println("Multi proxy enabled:", co.MultiProxy)
 		fmt.Println("VITA proxy port:", co.VitaProxyPort)
-		fmt.Println("Proxy base TCP port:", co.ProxyBasePort)
 		fmt.Println("Ignore radios/clients:", co.IgnoreRadios)
 		fmt.Println("Broadcast/Server port:", co.BroadcastPort)
 	}
 
 	return co, nil
+}
+
+func parseProxyLANSourceIPs(raw string) ([]net.IP, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+
+	seen := map[string]bool{}
+	var out []net.IP
+	for _, tok := range strings.Split(raw, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+		ip := net.ParseIP(tok)
+		if ip == nil || ip.To4() == nil {
+			return nil, fmt.Errorf("PROXY_LAN_SOURCE_IPS contains invalid IPv4 address %q", tok)
+		}
+		ip = ip.To4()
+		key := ip.String()
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, ip)
+	}
+	return out, nil
+}
+
+func formatIPList(ips []net.IP) string {
+	if len(ips) == 0 {
+		return "(default route)"
+	}
+	out := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		out = append(out, ip.String())
+	}
+	return strings.Join(out, ",")
 }
 
 func discoveryField(payload, key string) string {
@@ -266,9 +313,9 @@ func ListenForVitaStreamPackets(co utils.ConfigOptions) error {
 			continue
 		}
 
-		// Proxy mode: packet is destined to server IP, so route by the proxied
-		// TCP session whose negotiated UDP port matches this radio packet.
-		proxyTargets := utils.GetVitaProxyTargets(radioIP, int(udp.DstPort))
+		// Proxy mode: packet is destined to a server LAN IP, so route by the
+		// proxied TCP session whose source LAN IP and UDP port match it.
+		proxyTargets := utils.GetVitaProxyTargetsForDestination(radioIP, ipv4.DstIP.String(), int(udp.DstPort))
 		if len(proxyTargets) > 0 {
 			sent := false
 			for _, target := range proxyTargets {
@@ -324,8 +371,9 @@ and retransmits them via UDP to registered flexclient instances over the VPN.
 Flexclients must first send a HELLO control packet:
   HELLO client_ip=<netbird_ip> client_version=<version>
 
-Flextool validates client_ip against the VPN db (flextool.db) and then
-forwards FlexRadio discovery packets only to authorized, registered clients.
+By default, Flextool validates client_ip against the VPN db (flextool.db).
+Set CLIENT_AUTH_MODE=registered for deployments where
+live HELLO registrations should be trusted without a NetBird user sync.
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		viperConfig := GetConfig()
@@ -337,12 +385,14 @@ forwards FlexRadio discovery packets only to authorized, registered clients.
 		viperConfig.BindEnv("SEND_INTERFACE")
 		viperConfig.BindEnv("DISCOVERY_DELAY_SECONDS")
 		viperConfig.BindEnv("SYNC_INTERVAL_SECONDS")
+		viperConfig.BindEnv("CLIENT_AUTH_MODE")
 		viperConfig.BindEnv("IGNORE_RADIOS")
 		viperConfig.BindEnv("NETBIRD_API_TOKEN")
 		viperConfig.BindEnv("NETBIRD_API_URL")
 		viperConfig.BindEnv("ENABLE_VITA_PROXY")
 		viperConfig.BindEnv("VITA_PROXY_PORT")
 		viperConfig.BindEnv("PROXY_BASE_PORT")
+		viperConfig.BindEnv("PROXY_LAN_SOURCE_IPS")
 		viperConfig.BindEnv("MULTI_PROXY")
 
 		viperConfig.AutomaticEnv()
@@ -358,9 +408,6 @@ forwards FlexRadio discovery packets only to authorized, registered clients.
 			fmt.Println("Error starting client registration server:", err)
 			return
 		}
-
-		// SmartSDR compatibility: accept proxy TCP on :4992 and route by selected serial.
-		utils.StartSharedProxyListener(co)
 
 		if co.SyncIntervalSeconds > 0 {
 			syncConfig, err := ViperValidateSyncConfigOptions(viperConfig)

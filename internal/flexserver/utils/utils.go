@@ -14,10 +14,23 @@ import (
 	"github.com/littleairmada/vrt"
 )
 
+const udpSocketBufferSize = 4 * 1024 * 1024
+
 type NetbirdApi struct {
 	Password string
 	Url      string
 }
+
+var (
+	vitaSendLogMu            sync.Mutex
+	vitaSendLastLogByID      = map[string]time.Time{}
+	vitaSendLastPacketByID   = map[string]time.Time{}
+	vitaSendLastLogCountByID = map[string]uint64{}
+	vitaSendCountByID        = map[string]uint64{}
+	vitaSendBytesByID        = map[string]uint64{}
+	vitaSendLastLogBytesByID = map[string]uint64{}
+	vitaSendMaxGapByID       = map[string]time.Duration{}
+)
 
 type NetInteface struct {
 	Name       string
@@ -40,9 +53,11 @@ type ConfigOptions struct {
 	BroadcastPort         int
 	DiscoveryDelaySeconds int
 	SyncIntervalSeconds   int
+	ClientAuthMode        string
 	EnableVitaProxy       bool
 	VitaProxyPort         int
 	ProxyBasePort         int
+	ProxyLANSourceIPs     []net.IP
 	MultiProxy            bool
 	IgnoreRadios          []string
 
@@ -87,14 +102,21 @@ type VpnRouteRow struct {
 // ---------------------------------------------------------------------
 
 type ClientInfo struct {
-	Addr    *net.UDPAddr
-	IP      string
-	Version string
+	Addr         *net.UDPAddr
+	IP           string
+	Version      string
+	RegisteredAt time.Time
+	LastSeen     time.Time
 }
 
 var activeClients sync.Map // key: client_ip -> *ClientInfo
 
-const heartbeatInterval = 30 * time.Second
+const (
+	ClientAuthModeDB         = "db"
+	ClientAuthModeRegistered = "registered"
+	heartbeatInterval        = 30 * time.Second
+	clientRegistrationTTL    = 2 * time.Minute
+)
 
 // GetNetworkInterfaceByName returns details about a single user provided interface
 func GetNetworkInterfaceByName(name string) {
@@ -165,11 +187,22 @@ func PrintVrtPacket(vrt_packet vrt.VRT) {
 	fmt.Println(hex.Dump(vrt_packet.Payload))
 }
 
+func NormalizeClientAuthMode(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", ClientAuthModeDB, "database", "netbird":
+		return ClientAuthModeDB
+	case ClientAuthModeRegistered, "registration", "manual", "open", "none":
+		return ClientAuthModeRegistered
+	default:
+		return ClientAuthModeDB
+	}
+}
+
 // ---------------------------------------------------------------------
-// Authorization helper (check HELLO client_ip against DB)
+// Authorization helper
 // ---------------------------------------------------------------------
 
-func isAuthorizedClient(ip string) bool {
+func isAuthorizedClientInDB(ip string) bool {
 	u, err := UsersDb()
 	if err != nil {
 		log.Printf("[AUTH] error opening db for ip %s: %v\n", ip, err)
@@ -183,6 +216,30 @@ func isAuthorizedClient(ip string) bool {
 	return ok
 }
 
+func isAuthorizedClient(ip string, co *ConfigOptions) bool {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return false
+	}
+	if co != nil && NormalizeClientAuthMode(co.ClientAuthMode) == ClientAuthModeRegistered {
+		return true
+	}
+	return isAuthorizedClientInDB(ip)
+}
+
+func isIgnoredClient(ip string, co ConfigOptions) bool {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return true
+	}
+	for _, ignoreIP := range co.IgnoreRadios {
+		if ip == strings.TrimSpace(ignoreIP) {
+			return true
+		}
+	}
+	return false
+}
+
 // ---------------------------------------------------------------------
 // HELLO tracking: client_ip + client_version
 // ---------------------------------------------------------------------
@@ -190,7 +247,15 @@ func isAuthorizedClient(ip string) bool {
 // Expected HELLO format from flexclient:
 //
 //	"HELLO client_ip=100.85.50.11 client_version=0.1.0"
-func registerClient(addr *net.UDPAddr, payload []byte, debug bool) {
+func registerClient(addr *net.UDPAddr, payload []byte, co *ConfigOptions) {
+	if co == nil {
+		return
+	}
+	debug := co.EnableDebug
+	if HandleClientVitaTX(addr.IP.String(), *co, payload) {
+		return
+	}
+
 	line := strings.TrimSpace(string(payload))
 
 	if strings.HasPrefix(line, "PROXY_SELECT") {
@@ -214,7 +279,7 @@ func registerClient(addr *net.UDPAddr, payload []byte, debug bool) {
 			}
 		}
 
-		if clientIP != "" && isAuthorizedClient(clientIP) && serial != "" {
+		if clientIP != "" && isAuthorizedClient(clientIP, co) && serial != "" {
 			SetClientSelectedProxySerial(clientIP, serial)
 			if debug {
 				fmt.Printf("[PROXY] select client_ip=%s serial=%s\n", clientIP, serial)
@@ -233,9 +298,11 @@ func registerClient(addr *net.UDPAddr, payload []byte, debug bool) {
 	}
 
 	ci := &ClientInfo{
-		Addr:    addr,
-		IP:      addr.IP.String(), // default to socket source IP
-		Version: "",
+		Addr:         addr,
+		IP:           addr.IP.String(), // default to socket source IP
+		Version:      "",
+		RegisteredAt: time.Now(),
+		LastSeen:     time.Now(),
 	}
 
 	parts := strings.Fields(line)
@@ -259,14 +326,17 @@ func registerClient(addr *net.UDPAddr, payload []byte, debug bool) {
 	}
 
 	// Authorize against VPN DB
-	if !isAuthorizedClient(ci.IP) {
+	if !isAuthorizedClient(ci.IP, co) {
 		if debug {
-			fmt.Printf("[DENY] HELLO from %s (client_ip=%s, version=%s) - not in VPN DB, ignoring\n",
-				addr.String(), ci.IP, ci.Version)
+			fmt.Printf("[DENY] HELLO from %s (client_ip=%s, version=%s) auth_mode=%s\n",
+				addr.String(), ci.IP, ci.Version, NormalizeClientAuthMode(co.ClientAuthMode))
 		}
 		return
 	}
 
+	if existing, ok := getClientInfo(ci.IP); ok && existing.RegisteredAt.IsZero() == false {
+		ci.RegisteredAt = existing.RegisteredAt
+	}
 	activeClients.Store(ci.IP, ci)
 
 	if debug {
@@ -278,6 +348,10 @@ func registerClient(addr *net.UDPAddr, payload []byte, debug bool) {
 func getClientInfo(ip string) (*ClientInfo, bool) {
 	if v, ok := activeClients.Load(ip); ok {
 		if ci, ok2 := v.(*ClientInfo); ok2 {
+			if !ci.LastSeen.IsZero() && time.Since(ci.LastSeen) > clientRegistrationTTL {
+				activeClients.Delete(ip)
+				return nil, false
+			}
 			return ci, true
 		}
 	}
@@ -289,6 +363,64 @@ func getClientAddr(ip string) (*net.UDPAddr, bool) {
 		return ci.Addr, true
 	}
 	return nil, false
+}
+
+type discoveryTarget struct {
+	IP          string
+	ConnectedAt time.Time
+}
+
+func registeredDiscoveryTargets(co ConfigOptions) []discoveryTarget {
+	now := time.Now()
+	var out []discoveryTarget
+	activeClients.Range(func(key, value any) bool {
+		ci, ok := value.(*ClientInfo)
+		if !ok || ci == nil || ci.Addr == nil || strings.TrimSpace(ci.IP) == "" {
+			return true
+		}
+		if !ci.LastSeen.IsZero() && now.Sub(ci.LastSeen) > clientRegistrationTTL {
+			activeClients.Delete(key)
+			return true
+		}
+		if isIgnoredClient(ci.IP, co) {
+			if co.EnableDebug {
+				fmt.Println("[IGNORE] Skipping registered client", ci.IP)
+			}
+			return true
+		}
+		connectedAt := ci.RegisteredAt
+		if connectedAt.IsZero() {
+			connectedAt = ci.LastSeen
+		}
+		out = append(out, discoveryTarget{IP: ci.IP, ConnectedAt: connectedAt})
+		return true
+	})
+	return out
+}
+
+func dbDiscoveryTargets(co ConfigOptions) ([]discoveryTarget, error) {
+	u, err := UsersDb()
+	if err != nil {
+		return nil, fmt.Errorf("error accessing db: %w", err)
+	}
+
+	clientIPs, err := u.GetUserIpAddresses()
+	if err != nil {
+		return nil, fmt.Errorf("error retrieving vpn client ips from sqlite db: %w", err)
+	}
+
+	out := make([]discoveryTarget, 0, len(clientIPs))
+	for _, clientIP := range clientIPs {
+		if isIgnoredClient(clientIP, co) {
+			if co.EnableDebug {
+				fmt.Println("[IGNORE] Skipping discovery for", clientIP)
+			}
+			continue
+		}
+		connectedAt, _ := u.GetConnectedTime(clientIP)
+		out = append(out, discoveryTarget{IP: clientIP, ConnectedAt: connectedAt})
+	}
+	return out, nil
 }
 
 // StartClientRegistrationServer listens on SendNetworkInterface:BroadcastPort
@@ -305,18 +437,20 @@ func StartClientRegistrationServer(co *ConfigOptions) error {
 		return fmt.Errorf("failed to start client registration listener on %s:%d: %w",
 			co.SendNetworkInterface.IPAddress.String(), co.BroadcastPort, err)
 	}
+	_ = conn.SetReadBuffer(udpSocketBufferSize)
+	_ = conn.SetWriteBuffer(udpSocketBufferSize)
 
 	co.SendConn = conn
 
 	// Reader goroutine (HELLOs)
 	go func() {
-		buf := make([]byte, 2048)
+		buf := make([]byte, 8192)
 		for {
 			n, addr, err := conn.ReadFromUDP(buf)
 			if err != nil {
 				continue
 			}
-			registerClient(addr, buf[:n], co.EnableDebug)
+			registerClient(addr, buf[:n], co)
 		}
 	}()
 
@@ -366,11 +500,6 @@ func MaybeSendDiscoveryPacket(co ConfigOptions, p vrt.VRT) {
 		return
 	}
 
-	u, err := UsersDb()
-	if err != nil {
-		log.Fatal("error accessing db: ", err.Error())
-	}
-
 	// Serialize packet to bytes
 	buf := gopacket.NewSerializeBuffer()
 	opts := gopacket.SerializeOptions{FixLengths: false, ComputeChecksums: false}
@@ -379,41 +508,36 @@ func MaybeSendDiscoveryPacket(co ConfigOptions, p vrt.VRT) {
 		return
 	}
 
-	client_ips, err := u.GetUserIpAddresses()
-	if err != nil {
-		fmt.Println("Error retrieving vpn client ips from sqlite db:", err)
-		return
+	var targets []discoveryTarget
+	if NormalizeClientAuthMode(co.ClientAuthMode) == ClientAuthModeRegistered {
+		targets = registeredDiscoveryTargets(co)
+	} else {
+		var err error
+		targets, err = dbDiscoveryTargets(co)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
 	}
 
-	for _, clientIp := range client_ips {
-		// Check ignore list (keep original semantics: return exits function)
-		for _, ignoreIP := range co.IgnoreRadios {
-			if clientIp == strings.TrimSpace(ignoreIP) {
-				if co.EnableDebug {
-					fmt.Println("[IGNORE] Skipping discovery for", clientIp)
-				}
-				return
-			}
-		}
-
-		go func(ip string) {
-			connectedTime, err := u.GetConnectedTime(ip)
+	for _, target := range targets {
+		go func(target discoveryTarget) {
 			delay := time.Duration(co.DiscoveryDelaySeconds) * time.Second
-			if err == nil && !connectedTime.IsZero() {
-				elapsed := time.Since(connectedTime)
+			if !target.ConnectedAt.IsZero() {
+				elapsed := time.Since(target.ConnectedAt)
 				if elapsed < delay {
 					wait := delay - elapsed
-					fmt.Printf("[DELAY] Waiting %v before sending discovery to %s\n", wait, ip)
+					fmt.Printf("[DELAY] Waiting %v before sending discovery to %s\n", wait, target.IP)
 					time.AfterFunc(wait, func() {
-						sendDiscoveryPacketTo(ip, co, buf.Bytes())
+						sendDiscoveryPacketTo(target.IP, co, buf.Bytes())
 					})
 					return
 				} else if co.EnableDebug {
-					fmt.Printf("[SEND NOW] %s connected %v ago, delay expired\n", ip, elapsed)
+					fmt.Printf("[SEND NOW] %s connected %v ago, delay expired\n", target.IP, elapsed)
 				}
 			}
-			sendDiscoveryPacketTo(ip, co, buf.Bytes())
-		}(clientIp)
+			sendDiscoveryPacketTo(target.IP, co, buf.Bytes())
+		}(target)
 	}
 }
 
@@ -421,6 +545,49 @@ func sendDiscoveryPacketTo(clientIp string, co ConfigOptions, payload []byte) {
 	if !SendPayloadToAuthorizedRegisteredClient(clientIp, co, payload, "DISCOVERY") && co.EnableDebug {
 		fmt.Printf("[SKIP] No active flexclient registration for %s; not sending discovery\n", clientIp)
 	}
+}
+
+func recordVitaSendMetric(clientIP, packetType string, payloadLen int) {
+	if !strings.HasPrefix(packetType, "VITA") {
+		return
+	}
+	key := packetType + "|" + strings.TrimSpace(clientIP)
+	now := time.Now()
+
+	vitaSendLogMu.Lock()
+	defer vitaSendLogMu.Unlock()
+
+	vitaSendCountByID[key]++
+	vitaSendBytesByID[key] += uint64(payloadLen)
+	if lastPacket := vitaSendLastPacketByID[key]; !lastPacket.IsZero() {
+		if gap := now.Sub(lastPacket); gap > vitaSendMaxGapByID[key] {
+			vitaSendMaxGapByID[key] = gap
+		}
+	}
+	vitaSendLastPacketByID[key] = now
+
+	last := vitaSendLastLogByID[key]
+	if now.Sub(last) < 5*time.Second {
+		return
+	}
+	elapsed := now.Sub(last).Seconds()
+	if last.IsZero() || elapsed <= 0 {
+		elapsed = 5
+	}
+	totalPackets := vitaSendCountByID[key]
+	totalBytes := vitaSendBytesByID[key]
+	intervalPackets := totalPackets - vitaSendLastLogCountByID[key]
+	intervalBytes := totalBytes - vitaSendLastLogBytesByID[key]
+	pps := float64(intervalPackets) / elapsed
+	maxGap := vitaSendMaxGapByID[key]
+
+	vitaSendLastLogByID[key] = now
+	vitaSendLastLogCountByID[key] = totalPackets
+	vitaSendLastLogBytesByID[key] = totalBytes
+	vitaSendMaxGapByID[key] = 0
+
+	fmt.Printf("[VITA-METRIC] send type=%s client=%s payload=%d total=%d pps=%.1f bytes=%d max_gap=%s\n",
+		packetType, clientIP, payloadLen, totalPackets, pps, intervalBytes, maxGap.Truncate(time.Millisecond))
 }
 
 // SendPayloadToAuthorizedRegisteredClient sends a payload to a registered flexclient
@@ -454,5 +621,6 @@ func SendPayloadToAuthorizedRegisteredClient(clientIP string, co ConfigOptions, 
 		fmt.Println("error sending udp packet via existing connection:", err)
 		return false
 	}
+	recordVitaSendMetric(clientIP, packetType, len(payload))
 	return true
 }

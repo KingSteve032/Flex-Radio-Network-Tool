@@ -3,19 +3,28 @@ package frnt
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
+
+	"github.com/KingSteve032/Flex-Radio-Network-Tool/internal/flexclient"
 )
 
 const clientSettingsFileName = "flexclient-settings.json"
 
 type proxySettingsFile struct {
-	ProxyBasePort int               `json:"proxy_base_port"`
+	VPNMode       string            `json:"vpn_mode"`
+	ManualRoutes  []manualRouteFile `json:"manual_routes"`
+	ProxyBasePort int               `json:"proxy_base_port,omitempty"`
 	RadioModes    map[string]string `json:"radio_modes"`
 	IgnoredRoutes []string          `json:"ignored_routes"`
+}
+
+type manualRouteFile struct {
+	ID string `json:"id"`
+	IP string `json:"ip"`
 }
 
 func clientSettingsPath() string {
@@ -37,8 +46,8 @@ func loadProxySettingsFromDisk() (proxySettingsFile, error) {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return proxySettingsFile{}, err
 	}
-	if cfg.ProxyBasePort == 0 {
-		cfg.ProxyBasePort = 30000
+	if strings.TrimSpace(cfg.VPNMode) == "" {
+		cfg.VPNMode = "netbird"
 	}
 	if cfg.RadioModes == nil {
 		cfg.RadioModes = map[string]string{}
@@ -47,12 +56,11 @@ func loadProxySettingsFromDisk() (proxySettingsFile, error) {
 }
 
 func saveProxySettingsToDisk(cfg proxySettingsFile) error {
-	if cfg.ProxyBasePort < 1024 || cfg.ProxyBasePort > 65535 {
-		return fmt.Errorf("proxy base port must be between 1024 and 65535")
-	}
 	if cfg.RadioModes == nil {
 		cfg.RadioModes = map[string]string{}
 	}
+	cfg.VPNMode = normalizeVPNModeText(cfg.VPNMode)
+	cfg.ManualRoutes = normalizeManualRouteFiles(cfg.ManualRoutes)
 	cfg.IgnoredRoutes = normalizeIgnoredRoutes(cfg.IgnoredRoutes)
 
 	path := clientSettingsPath()
@@ -61,6 +69,67 @@ func saveProxySettingsToDisk(cfg proxySettingsFile) error {
 		return err
 	}
 	return os.WriteFile(path, b, 0644)
+}
+
+func normalizeVPNModeText(mode string) string {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "manual" {
+		return "manual"
+	}
+	return "netbird"
+}
+
+func normalizeManualRouteFiles(in []manualRouteFile) []manualRouteFile {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]manualRouteFile, 0, len(in))
+	seen := map[string]bool{}
+	for _, route := range in {
+		id := strings.TrimSpace(route.ID)
+		ip := strings.TrimSpace(route.IP)
+		if id == "" || ip == "" {
+			continue
+		}
+		key := id + "=" + ip
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, manualRouteFile{ID: id, IP: ip})
+	}
+	return out
+}
+
+func manualRoutesFromSettings(in []manualRouteFile) []flexclient.ManualRoute {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]flexclient.ManualRoute, 0, len(in))
+	for _, route := range in {
+		id := strings.TrimSpace(route.ID)
+		ip := net.ParseIP(strings.TrimSpace(route.IP))
+		if id == "" || ip == nil {
+			continue
+		}
+		out = append(out, flexclient.ManualRoute{ID: id, IP: ip})
+	}
+	return out
+}
+
+func manualRoutesToSettings(in []flexclient.ManualRoute) []manualRouteFile {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]manualRouteFile, 0, len(in))
+	for _, route := range in {
+		id := strings.TrimSpace(route.ID)
+		if id == "" || route.IP == nil {
+			continue
+		}
+		out = append(out, manualRouteFile{ID: id, IP: route.IP.String()})
+	}
+	return normalizeManualRouteFiles(out)
 }
 
 func normalizeIgnoredRoutes(in []string) []string {
@@ -86,17 +155,6 @@ func normalizeIgnoredRoutes(in []string) []string {
 	return out
 }
 
-func parseProxyBasePort(s string) (int, error) {
-	p, err := strconv.Atoi(strings.TrimSpace(s))
-	if err != nil {
-		return 0, fmt.Errorf("invalid proxy base port")
-	}
-	if p < 1024 || p > 65535 {
-		return 0, fmt.Errorf("proxy base port must be between 1024 and 65535")
-	}
-	return p, nil
-}
-
 func parseRadioModesText(text string) (map[string]string, error) {
 	out := map[string]string{}
 	lines := strings.Split(text, "\n")
@@ -112,16 +170,27 @@ func parseRadioModesText(text string) (map[string]string, error) {
 		}
 
 		serial := strings.ToLower(strings.TrimSpace(kv[0]))
-		mode := strings.ToLower(strings.TrimSpace(kv[1]))
+		mode := normalizeRadioModeText(strings.TrimSpace(kv[1]))
 		if serial == "" {
 			return nil, fmt.Errorf("line %d: serial cannot be empty", i+1)
 		}
-		if mode != "direct" && mode != "proxy" && mode != "off" {
-			return nil, fmt.Errorf("line %d: mode must be direct, proxy, or off", i+1)
+		if mode == "" {
+			return nil, fmt.Errorf("line %d: mode must be on or off", i+1)
 		}
 		out[serial] = mode
 	}
 	return out, nil
+}
+
+func normalizeRadioModeText(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "on", "direct", "proxy", "enabled", "enable", "true", "yes":
+		return "direct"
+	case "off", "disabled", "disable", "false", "no":
+		return "off"
+	default:
+		return ""
+	}
 }
 
 func formatRadioModesText(m map[string]string) string {
@@ -136,7 +205,11 @@ func formatRadioModesText(m map[string]string) string {
 
 	lines := make([]string, 0, len(keys))
 	for _, k := range keys {
-		lines = append(lines, fmt.Sprintf("%s=%s", k, m[k]))
+		mode := "on"
+		if normalizeRadioModeText(m[k]) == "off" {
+			mode = "off"
+		}
+		lines = append(lines, fmt.Sprintf("%s=%s", k, mode))
 	}
 	return strings.Join(lines, "\n")
 }
