@@ -6,7 +6,7 @@ var (
 	// Version is the semantic version for this build.
 	// Override at build time with:
 	//   -ldflags "-X github.com/KingSteve032/Flex-Radio-Network-Tool/internal/buildinfo.Version=vX.Y.Z"
-	Version = "0.2.14"
+	Version = "0.2.15"
 
 	// Commit is the git commit used for this build.
 	Commit = "dev"

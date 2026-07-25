@@ -181,6 +181,23 @@ func markDiscovery(routeID, radioSerial string) {
 	rs.packetSeen++
 }
 
+func removeRadioFromOtherRoutes(ownerRouteID, radioSerial string) {
+	ownerRouteID = strings.TrimSpace(ownerRouteID)
+	radioSerial = strings.ToLower(strings.TrimSpace(radioSerial))
+	if ownerRouteID == "" || radioSerial == "" {
+		return
+	}
+
+	statusMu.Lock()
+	defer statusMu.Unlock()
+	for routeID, s := range routeStatusMap {
+		if routeID == ownerRouteID || s == nil || s.radioStats == nil {
+			continue
+		}
+		delete(s.radioStats, radioSerial)
+	}
+}
+
 // GetRouteRadioStatuses returns radios seen on this route in deterministic
 // serial order so UI rows stay stable while packet counters refresh.
 func GetRouteRadioStatuses(routeID string) []RouteRadioStatus {
@@ -194,6 +211,9 @@ func GetRouteRadioStatuses(routeID string) []RouteRadioStatus {
 
 	out := make([]RouteRadioStatus, 0, len(s.radioStats))
 	for serial, st := range s.radioStats {
+		if st == nil || time.Since(st.lastSeen) > discoveryCacheMaxAge {
+			continue
+		}
 		out = append(out, RouteRadioStatus{
 			Serial:     serial,
 			LastSeen:   st.lastSeen,

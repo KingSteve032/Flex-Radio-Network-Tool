@@ -95,6 +95,7 @@ type radioModeConfig struct {
 
 type cachedDiscovery struct {
 	serial   string
+	radioIP  string
 	raw      []byte
 	lastSeen time.Time
 }
@@ -136,6 +137,7 @@ type directAssistVITASession struct {
 type serialRouteOwner struct {
 	routeID  string
 	lastSeen time.Time
+	score    int
 }
 
 type vitaForwardFrame struct {
@@ -505,7 +507,29 @@ func dialDirectPunchUDP(localIP net.IP, dest *net.UDPAddr) (*net.UDPConn, error)
 	return conn, nil
 }
 
+func routeRadioAffinityScore(routeIP net.IP, radioIP string) int {
+	rv4 := routeIP.To4()
+	radioV4 := net.ParseIP(strings.TrimSpace(radioIP)).To4()
+	if rv4 == nil || radioV4 == nil {
+		return 0
+	}
+	if rv4.Equal(radioV4) {
+		return 100
+	}
+	if rv4[0] == radioV4[0] && rv4[1] == radioV4[1] && rv4[2] == radioV4[2] {
+		return 90
+	}
+	if rv4[0] == radioV4[0] && rv4[1] == radioV4[1] {
+		return 40
+	}
+	return 0
+}
+
 func claimSerialOwner(routeID, serial string, now time.Time) bool {
+	return claimSerialOwnerWithScore(routeID, serial, now, 0)
+}
+
+func claimSerialOwnerWithScore(routeID, serial string, now time.Time, score int) bool {
 	serial = strings.ToLower(strings.TrimSpace(serial))
 	routeID = strings.TrimSpace(routeID)
 	if serial == "" || routeID == "" {
@@ -520,21 +544,33 @@ func claimSerialOwner(routeID, serial string, now time.Time) bool {
 
 	current, ok := serialOwnerByID[serial]
 	if !ok {
-		serialOwnerByID[serial] = serialRouteOwner{routeID: routeID, lastSeen: now}
+		serialOwnerByID[serial] = serialRouteOwner{routeID: routeID, lastSeen: now, score: score}
 		return true
 	}
 
 	// Owner heartbeat refresh.
 	if current.routeID == routeID {
 		current.lastSeen = now
+		if score > current.score {
+			current.score = score
+		}
 		serialOwnerByID[serial] = current
+		return true
+	}
+
+	if score > current.score {
+		log.Printf("flexclient: serial owner affinity takeover serial=%s %s(score=%d) -> %s(score=%d)",
+			serial, current.routeID, current.score, routeID, score)
+		serialOwnerByID[serial] = serialRouteOwner{routeID: routeID, lastSeen: now, score: score}
+		removeRadioFromOtherRoutes(routeID, serial)
 		return true
 	}
 
 	// Allow takeover only after owner inactivity window.
 	if now.Sub(current.lastSeen) > serialOwnerHold {
 		log.Printf("flexclient: serial owner takeover serial=%s %s -> %s", serial, current.routeID, routeID)
-		serialOwnerByID[serial] = serialRouteOwner{routeID: routeID, lastSeen: now}
+		serialOwnerByID[serial] = serialRouteOwner{routeID: routeID, lastSeen: now, score: score}
+		removeRadioFromOtherRoutes(routeID, serial)
 		return true
 	}
 
@@ -1791,9 +1827,11 @@ func rebroadcastCachedDiscoveries(
 		if now.Sub(entry.lastSeen) > discoveryCacheRebroadcastFreshAge {
 			continue
 		}
-		if !claimSerialOwner(route.ID, entry.serial, now) {
+		score := routeRadioAffinityScore(route.IP, entry.radioIP)
+		if !claimSerialOwnerWithScore(route.ID, entry.serial, now, score) {
 			continue
 		}
+		markDiscovery(route.ID, entry.serial)
 		applyDiscoveryModeAndBroadcast(conn, route.ID, clientIP, route.IP.String(), entry.serial, entry.raw, false, "")
 	}
 }
@@ -1905,6 +1943,7 @@ func runForServer(ctx context.Context, route Route, version string) {
 		if serial == "" {
 			continue
 		}
+		radioIP := strings.TrimSpace(fieldValue(discoveryText, "ip"))
 		if !isModernDiscoveryPayload(discoveryText) {
 			continue
 		}
@@ -1912,17 +1951,19 @@ func runForServer(ctx context.Context, route Route, version string) {
 		now = time.Now()
 		discoveryCache[serial] = cachedDiscovery{
 			serial:   serial,
+			radioIP:  radioIP,
 			raw:      append([]byte(nil), payload...),
 			lastSeen: now,
 		}
 
-		markDiscovery(route.ID, serial)
 		if IsRouteIgnored(route.ID) {
 			continue
 		}
-		if !claimSerialOwner(route.ID, serial, now) {
+		score := routeRadioAffinityScore(route.IP, radioIP)
+		if !claimSerialOwnerWithScore(route.ID, serial, now, score) {
 			continue
 		}
+		markDiscovery(route.ID, serial)
 		applyDiscoveryModeAndBroadcast(conn, route.ID, clientIP, route.IP.String(), serial, payload, true, discoveryText)
 	}
 }
