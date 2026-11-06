@@ -48,7 +48,7 @@ jobs:
           ar t "$package" | grep -Fxq control.tar.gz
           ar t "$package" | grep -Fxq data.tar.gz
           ar p "$package" debian-binary | grep -Fxq '2.0'
-          ar p "$package" data.tar.gz | tar -tzf - | grep -Fq 'usr/bin/frnt-openwrt-client'
+          ar p "$package" data.tar.gz | tar -tzf - | grep -F 'usr/bin/frnt-openwrt-client'
           sha256sum "$package" > SHA256SUMS.txt
           ls -lh "$package" SHA256SUMS.txt
 
