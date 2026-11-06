@@ -1,0 +1,82 @@
+name: Build FRNT OpenWrt Client
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "openwrt-client/**"
+      - ".github/workflows/openwrt-client.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: frnt-openwrt-client-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-ipk:
+    name: Test, build and publish OpenWrt ARM64 package
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: openwrt-client/go.mod
+          cache-dependency-path: openwrt-client/go.mod
+
+      - name: Test FRNT client
+        working-directory: openwrt-client
+        run: go test -mod=mod -v ./...
+
+      - name: Build OpenWrt ARM64 IPK
+        run: bash openwrt-client/build-ipk.sh
+
+      - name: Validate package and write checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd openwrt-client/dist
+          package=frnt-openwrt-client_0.1.1_aarch64_cortex-a53_neon-vfpv4.ipk
+          test -s "$package"
+          ar t "$package" | grep -Fxq debian-binary
+          ar t "$package" | grep -Fxq control.tar.gz
+          ar t "$package" | grep -Fxq data.tar.gz
+          ar p "$package" debian-binary | grep -Fxq '2.0'
+          ar p "$package" data.tar.gz | tar -tzf - | grep -Fq 'usr/bin/frnt-openwrt-client'
+          sha256sum "$package" > SHA256SUMS.txt
+          ls -lh "$package" SHA256SUMS.txt
+
+      - name: Upload GitHub Actions build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frnt-openwrt-client-v0.1.1
+          path: |
+            openwrt-client/dist/*.ipk
+            openwrt-client/dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish public release download
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: openwrt-client-v0.1.1
+          target_commitish: ${{ github.sha }}
+          name: FRNT OpenWrt Client v0.1.1 (GL-AXT1800)
+          make_latest: false
+          generate_release_notes: false
+          body: |
+            Headless FRNT discovery client for the GL.iNet GL-AXT1800 (OpenWrt 23.05-SNAPSHOT, ARM64).
+
+            This package requires NetBird on the router. Configure the FRNT server's NetBird IPv4 and the LAN/VPN interface names before starting. See openwrt-client/README.md in the source repository for installation instructions.
+
+            **Discovery-only:** this version rebroadcasts remote FlexRadio discovery frames onto the local LAN. It does not provide SmartSDR TCP/VITA control or streaming proxies.
+          files: |
+            openwrt-client/dist/*.ipk
+            openwrt-client/dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true

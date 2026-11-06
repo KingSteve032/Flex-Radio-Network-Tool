@@ -1,0 +1,5 @@
+config frnt-client 'main'
+	option server ''
+	option netbird_routes '0'
+	option vpn_interface 'wt0'
+	option lan_interface 'br-lan'
