@@ -191,6 +191,18 @@ func run(ctx context.Context, serverIP net.IP, interfaceName, vpnInterface strin
 // Validate the VRT frame and discovery metadata before forwarding any bytes
 // onto the LAN. Match the upstream client's modern-discovery requirement.
 func discoveryFields(packet []byte) (serial string, radioIP string, err error) {
+	// Upstream vrt.DecodeFromBytes may panic on truncated or malformed network
+	// frames instead of returning an error. Never let an untrusted UDP packet
+	// crash the router service.
+	if len(packet) < 16 {
+		return "", "", fmt.Errorf("truncated VRT packet")
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			serial, radioIP = "", ""
+			err = fmt.Errorf("invalid VRT packet: %v", r)
+		}
+	}()
 	v := vrt.VRT{}
 	if err := v.DecodeFromBytes(packet, gopacket.NilDecodeFeedback); err != nil {
 		return "", "", err
