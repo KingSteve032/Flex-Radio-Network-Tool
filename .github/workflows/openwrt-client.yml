@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   build-ipk:
-    name: Test, build and publish OpenWrt ARM64 package
+    name: Test and publish router + LuCI packages
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout source
@@ -30,52 +30,77 @@ jobs:
           go-version-file: openwrt-client/go.mod
           cache-dependency-path: openwrt-client/go.mod
 
+      - name: Validate scripts and LuCI source
+        run: |
+          set -euo pipefail
+          bash -n openwrt-client/build-ipk.sh
+          sh -n openwrt-client/openwrt/etc/init.d/frnt-client
+          sh -n openwrt-client/openwrt/usr/libexec/frnt-client-query
+          sh -n openwrt-client/openwrt/usr/libexec/frnt-client-control
+          node --check openwrt-client/luci/www/luci-static/resources/view/frnt/client.js
+          python3 -m json.tool openwrt-client/luci/usr/share/rpcd/acl.d/luci-app-frnt-client.json > /dev/null
+          python3 -m json.tool openwrt-client/luci/usr/share/luci/menu.d/luci-app-frnt-client.json > /dev/null
+
       - name: Test FRNT client
         working-directory: openwrt-client
-        run: go test -mod=mod -v ./...
+        run: |
+          go vet -mod=mod ./...
+          go test -mod=mod -v ./...
 
-      - name: Build OpenWrt ARM64 IPK
+      - name: Build OpenWrt ARM64 and LuCI IPKs
         run: bash openwrt-client/build-ipk.sh
 
-      - name: Validate package and write checksum
+      - name: Validate OpenWrt tar-gzip packages and write checksums
         shell: bash
         run: |
           set -euo pipefail
           cd openwrt-client/dist
-          package=frnt-openwrt-client_0.1.1_aarch64_cortex-a53_neon-vfpv4.ipk
-          test -s "$package"
-          ar t "$package" | grep -Fxq debian-binary
-          ar t "$package" | grep -Fxq control.tar.gz
-          ar t "$package" | grep -Fxq data.tar.gz
-          ar p "$package" debian-binary | grep -Fxq '2.0'
-          ar p "$package" data.tar.gz | tar -tzf - | grep -F 'usr/bin/frnt-openwrt-client'
-          sha256sum "$package" > SHA256SUMS.txt
-          ls -lh "$package" SHA256SUMS.txt
+          base=frnt-openwrt-client_0.1.2_aarch64_cortex-a53_neon-vfpv4.ipk
+          luci=luci-app-frnt-client_0.1.2_all.ipk
+          for package in "$base" "$luci"; do
+            test -s "$package"
+            tar -tzf "$package" | grep -Fx './debian-binary'
+            tar -tzf "$package" | grep -Fx './control.tar.gz'
+            tar -tzf "$package" | grep -Fx './data.tar.gz'
+            tar -xOzf "$package" ./debian-binary | grep -Fx '2.0'
+            tar -xOzf "$package" ./control.tar.gz | tar -tzf - | grep -F './control'
+          done
+          tar -xOzf "$base" ./data.tar.gz | tar -tzf - | grep -F './usr/bin/frnt-openwrt-client'
+          tar -xOzf "$luci" ./data.tar.gz | tar -tzf - | grep -F './www/luci-static/resources/view/frnt/client.js'
+          sha256sum "$base" "$luci" > SHA256SUMS.txt
+          ls -lh "$base" "$luci" SHA256SUMS.txt
 
-      - name: Upload GitHub Actions build artifact
+      - name: Upload Actions artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: frnt-openwrt-client-v0.1.1
+          name: frnt-openwrt-client-v0.1.2
           path: |
             openwrt-client/dist/*.ipk
             openwrt-client/dist/SHA256SUMS.txt
           if-no-files-found: error
 
-      - name: Publish public release download
+      - name: Publish public OpenWrt release
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: openwrt-client-v0.1.1
+          tag_name: openwrt-client-v0.1.2
           target_commitish: ${{ github.sha }}
-          name: FRNT OpenWrt Client v0.1.1 (GL-AXT1800)
+          name: FRNT OpenWrt Client v0.1.2 + LuCI
           make_latest: false
           generate_release_notes: false
           body: |
-            Headless FRNT discovery client for the GL.iNet GL-AXT1800 (OpenWrt 23.05-SNAPSHOT, ARM64).
+            Updated GL-AXT1800 / OpenWrt 23.05 FRNT discovery client.
 
-            This package requires NetBird on the router. Configure the FRNT server's NetBird IPv4 and the LAN/VPN interface names before starting. See openwrt-client/README.md in the source repository for installation instructions.
+            - **Fixed OpenWrt .ipk archive format** (previous v0.1.1 used Debian-style ar packaging)
+            - **frnt-openwrt-client...ipk**: headless client + procd service
+            - **luci-app-frnt-client...ipk**: optional LuCI Services → FRNT Discovery Client controls
+            - Includes NetBird interface check, configuration, Start/Stop/Restart, status, and FRNT logs.
 
-            **Discovery-only:** this version rebroadcasts remote FlexRadio discovery frames onto the local LAN. It does not provide SmartSDR TCP/VITA control or streaming proxies.
+            **Server diagnostics:** `connection refused` to the server's NetBird IP UDP 14992 means the server listener or firewall is rejecting the control traffic. Check that FRNT server mode is running and that `SEND_INTERFACE` is set to the NetBird interface.
+
+            **Discovery-only:** SmartSDR control/TCP and VITA forwarding still require routing or proxy support.
+
+            See `openwrt-client/README.md` for installation and troubleshooting.
           files: |
             openwrt-client/dist/*.ipk
             openwrt-client/dist/SHA256SUMS.txt

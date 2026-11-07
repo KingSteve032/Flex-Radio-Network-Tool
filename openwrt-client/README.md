@@ -1,112 +1,118 @@
-# FRNT OpenWrt Discovery Client (GL-AXT1800)
+# FRNT OpenWrt Client for GL.iNet GL-AXT1800
 
-A **router-side client**, not the FRNT server. It connects over the router's
-existing VPN route to an FRNT server on UDP 14992, sends periodic FRNT `HELLO`
-registrations, validates incoming modern FlexRadio VRT discovery frames, and
-rebroadcasts them from **one explicitly chosen LAN interface** to UDP 4992.
+This is an **FRNT client** for the router, not an FRNT server.
 
-This is a headless, discovery-only OpenWrt implementation of the upstream
-FRNT client's HELLO/discovery protocol. It deliberately does **not** use the
-desktop GUI, run libpcap/SQLite, expose a listener, or broadcast onto the WAN.
-It is **not** a full replacement for the upstream Flexclient's SmartSDR
-TCP/direct-assist and VITA stream handling.
+The GL-AXT1800 joins NetBird as a VPN peer, registers with your existing
+FRNT server on **UDP 14992**, receives validated FlexRadio discovery
+frames, and rebroadcasts those frames only on the chosen local LAN
+(for example `br-lan` at `192.168.8.1/24`) via **UDP 4992**.
 
-Upstream protocol source: https://github.com/KingSteve032/Flex-Radio-Network-Tool
-Reviewed against: upstream `main` as of 2026-11-06, release v0.2.15.
+This is a **discovery-only** release. SmartSDR control, VITA stream
+routing and remote radio connections require additional VPN routing and
+possibly proxy/NAT features. Discovery alone does not provide radio access.
 
-## Target
+## Download (GitHub Actions, no Go required on the router)
 
-- GL.iNet GL-AXT1800 (Slate AX), OpenWrt 23.05-SNAPSHOT
-- `aarch64` kernel and `aarch64_cortex-a53_neon-vfpv4` opkg architecture
-- NetBird installed, connected, and managing the `wt0` VPN interface
-- FRNT server VPN IPv4 reachable across NetBird (no WAN fallback)
-- LAN bridge typically `br-lan` (verify on the actual router)
-- The router and FRNT server must be allowed to exchange UDP 14992 by NetBird ACL policy
+Public release: https://github.com/KingSteve032/Flex-Radio-Network-Tool/releases/tag/openwrt-client-v0.1.2
 
-## Downloadable GitHub Actions build (recommended)
+Two packages are built and independently validated by GitHub Actions:
 
-The `Build FRNT OpenWrt Client` GitHub Actions workflow runs tests, builds an
-ARM64 `.ipk`, checks its package layout, generates `SHA256SUMS.txt`, and
-uploads the files to the **public GitHub Releases page**.
+1. `frnt-openwrt-client_0.1.2_aarch64_cortex-a53_neon-vfpv4.ipk`:
+   ARM64 headless client and OpenWrt `procd` service.
+2. `luci-app-frnt-client_0.1.2_all.ipk`:
+   Optional web interface (LuCI > Services > FRNT Discovery Client).
+   Requires LuCI already installed on the GL.iNet router.
+   Its dependency on `luci-base` and `rpcd-mod-file` must be satisfied.
 
-Download the package at:
+Also download `SHA256SUMS.txt` to verify the package files.
 
-https://github.com/KingSteve032/Flex-Radio-Network-Tool/releases/tag/openwrt-client-v0.1.1
+**The previous v0.1.1 installer was packaged incorrectly as an `ar`
+archive. Version 0.1.2 uses the OpenWrt-standard gzip-compressed tar
+IPK container.** The original failure was not caused by ARM64 support.
 
-The person installing on the router **does not need Go, DevSpace, or a GitHub
-account** to download a public release asset.
+Target: GL.iNet GL-AXT1800 / OpenWrt 23.05-SNAPSHOT /
+`aarch64_cortex-a53_neon-vfpv4`. Confirm the router's architecture using
+`opkg print-architecture` before installing. This version is tested by
+GitHub Actions, **not yet tested on physical GL-AXT1800 hardware**.
 
-If the workflow has not finished successfully, that release will not be
-available yet. Check the repository Actions tab for the build result.
+## Router installation
 
-## Build locally on a Go-equipped host
-
-Requires Go 1.25+, GNU `ar`, and `tar`. Building uses a statically linked
-Linux/ARM64 Go executable, so no on-router Go SDK or libpcap is required.
+The person with the router should download the two IPKs from the release
+and copy both to the router's `/tmp` folder (e.g. SCP). On the router:
 
 ```sh
-cd openwrt-client
-go test -mod=mod ./...
-bash build-ipk.sh
+opkg print-architecture
+opkg install /tmp/frnt-openwrt-client_0.1.2_aarch64_cortex-a53_neon-vfpv4.ipk
 ```
 
-The build outputs:
-`dist/frnt-openwrt-client_0.1.1_aarch64_cortex-a53_neon-vfpv4.ipk`
-
-**Not yet built or tested on the GL-AXT1800.** Verify the router's opkg
-architecture and firmware version before installing. A vendor-specific
-OpenWrt snapshot may need additional checks.
-
-## Configure and start on the router
-
-Copy the IPK to the router, then:
+If LuCI is installed, install the separate frontend as well:
 
 ```sh
-opkg install /tmp/frnt-openwrt-client_0.1.1_aarch64_cortex-a53_neon-vfpv4.ipk
-netbird status -d
-ip -4 addr show dev wt0
-uci set frnt-client.main.server='YOUR_FRNT_SERVER_VPN_IPV4'
+opkg install /tmp/luci-app-frnt-client_0.1.2_all.ipk
+/etc/init.d/rpcd restart
+/etc/init.d/uhttpd restart
+```
+
+If LuCI or its dependencies are missing, first install LuCI using the
+GL.iNet admin interface at **System > Advanced Settings**. If the vendor
+firmware package feeds cannot provide the required LuCI dependencies,
+leave the UI package uninstalled; the CLI service still works.
+
+The router's GL.iNet admin UI is not modified. Launch its LuCI
+**Advanced Settings** page, then select **Services > FRNT Discovery
+Client**. The page provides configuration fields, Start/Stop/Restart,
+status, NetBird interface details, and recent FRNT logs. No public
+unauthenticated control endpoint is opened.
+
+## Configure
+
+Ensure the NetBird peer is already connected and can reach the FRNT
+server VPN IP. For example, in the diagnostic report below,
+the router's NetBird IP is `100.85.12.187` on `wt0`,
+while the example server VPN IP is `100.85.50.97`.
+
+Set the **actual** FRNT server's NetBird IP and interfaces:
+
+```sh
+uci set frnt-client.main.server='100.85.50.97'
+uci set frnt-client.main.netbird_routes='0'
 uci set frnt-client.main.vpn_interface='wt0'
 uci set frnt-client.main.lan_interface='br-lan'
 uci commit frnt-client
 /etc/init.d/frnt-client start
 /etc/init.d/frnt-client status
-logread -e frnt
+logread -e FRNT
 ```
 
-Stop or restart:
+To use the UI, edit the same values through LuCI and click **Save & Apply**
+before pressing **Restart**.
+
+NetBird's `wt0` interface is mandatory for the FRNT control channel.
+FRNT uses `SO_BINDTODEVICE` and verifies its source address belongs to
+`wt0`, preventing fallback to the WAN. A missing or not-yet-up
+NetBird interface causes retries every 10 seconds. The client does not
+manage NetBird, its keys, or its routing.
+
+To stop or restart:
 
 ```sh
 /etc/init.d/frnt-client stop
 /etc/init.d/frnt-client restart
 ```
 
-Enable automatic startup only after a successful manual test:
+Enable/disable startup on boot after confirming it works:
 
 ```sh
 /etc/init.d/frnt-client enable
-```
-
-Disable automatic startup (does not stop an already-running process):
-
-```sh
 /etc/init.d/frnt-client disable
 ```
 
-## NetBird integration
+### Optional NetBird route discovery
 
-NetBird owns the VPN. FRNT does not start, stop, configure, or log in to NetBird.
-The FRNT UDP socket is **bound to wt0** using Linux `SO_BINDTODEVICE`
-and its chosen source IP is validated against that interface, so it will fail
-closed rather than trying the WAN when the VPN is absent.
+Manual VPN server IP is recommended; it works on older OpenWrt builds.
 
-The **recommended configuration** is to set the FRNT server's NetBird VPN IP
-explicitly using the UCI `server` setting above. This works with older
-OpenWrt-packaged NetBird versions, including those without route discovery.
-
-If your installed NetBird CLI supports `netbird routes list` and you already
-advertise a route **whose ID contains Flextool**, you may instead enable
-upstream-style automatic discovery of a single selected IPv4 /32 route:
+If your NetBird CLI supports `netbird routes list` and there is exactly
+one selected `Flextool` `/32` host route, you can use it instead:
 
 ```sh
 netbird routes list
@@ -116,49 +122,70 @@ uci commit frnt-client
 /etc/init.d/frnt-client restart
 ```
 
-This is optional. If the command is unavailable, the route is not a /32 host,
-or multiple Flextool routes are advertised, return to an explicit server IP:
+If this fails, return to `netbird_routes=0` and configure the server IP
+explicitly. NetBird release versions do not all expose identical CLI
+commands or route formats.
 
-```sh
-uci set frnt-client.main.netbird_routes='0'
-uci set frnt-client.main.server='YOUR_FRNT_SERVER_VPN_IPV4'
-uci commit frnt-client
-/etc/init.d/frnt-client restart
+## Troubleshooting "connection refused"
+
+Example router logs:
+
+```
+FRNT client started: server=100.85.50.97:14992 VPN=wt0 LAN=br-lan ...
+read udp4 100.85.12.187:35989->100.85.50.97:14992: read: connection refused
 ```
 
-**Important:** On OpenWrt 23.05, NetBird's package may be older than the
-version that provides `routes list`. We have not verified which commands your
-router's eventual NetBird installation supports.
+This shows the client selected the correct NetBird-side IP address and
+`wt0` is working locally. The destination (or a firewall in between)
+is rejecting UDP 14992, commonly because there is no FRNT process
+listening on that IP and port. This is **not** a broadcast failure.
 
-## Operational behavior
+On the FRNT **server machine** at the NetBird IP:
 
-- Transmits `HELLO client_ip=<router VPN-side source IP> client_version=openwrt-0.1.1`.
-- Sends HELLO every 30 seconds; counts server HEARTBEAT packets.
-- Rebroadcasts only recognized modern VRT discovery payloads, with radio
-  serial, IPv4 and port metadata, on the configured LAN subnet.
-- Keeps fresh discoveries available for up to 4 seconds via cached rebroadcast;
-  discards stale entries at 20 seconds.
-- Uses a specific directed-broadcast destination (for example
-  `192.168.8.255:4992`), never indiscriminately sends to all interfaces.
-- Starts only with a configured server IP or explicit NetBird route discovery.
-  Does not autostart by default.
-- Fails closed when `wt0` is unavailable, down, or the selected source address
-  does not belong to the VPN interface.
-- procd manages the service; logs go to OpenWrt's regular ring-buffer logs.
+```sh
+ip -4 addr show
+sudo ss -lunp | grep ':14992'
+sudo systemctl status frnt-listen --no-pager
+sudo journalctl -u frnt-listen -n 80 --no-pager
+```
 
-## Important limitations
+The upstream FRNT server startup requires:
 
-**Discovery is not radio connectivity.** SmartSDR on a LAN machine may see a
-remote radio, but cannot connect unless the advertised radio IP/port is
-reachable from that machine. The router must supply appropriate VPN routes,
-firewall forwarding and potentially a LAN-reachable TCP/VITA proxy to match
-the desktop client's direct-assist functionality. No NAT, routes or
-firewall rules are changed by this package. NetBird access to the server
-alone does not automatically give LAN computers access to remote radio IPs.
+- `--mode server listen` (not a client GUI process);
+- `SEND_INTERFACE` set to the server's NetBird interface name;
+- the default UDP port 14992, or `--port 14992`;
+- a valid `LISTEN_INTERFACE` for capturing FlexRadio LAN discovery;
+- NetBird ACLs and the host firewall permitting the router to reach
+  server UDP 14992.
 
-Only use an FRNT server you trust, on a protected network. The upstream
-registration protocol uses source/HELLO state, not cryptographic
-application-layer authentication. Do not expose UDP 14992 publicly.
+If the listener exists but discovery is absent, check the server
+`CLIENT_AUTH_MODE` and client authorization (either registered mode
+or the server's NetBird database). Authorization rejection generally
+wouldn't yield a UDP port-unreachable error; it would silently withhold
+registration and heartbeats.
 
-The GL.iNet UI/LuCI Start/Stop screen is planned separately; this initial
-package offers service start/stop/restart via OpenWrt's standard init tools.
+On the router:
+
+```sh
+ip -4 addr show dev wt0
+ip route get 100.85.50.97
+netbird status
+logread -e FRNT
+```
+
+Do not open the FRNT UDP control port to the public Internet.
+
+## Development
+
+Source is under `openwrt-client/`. GitHub Actions compiles a static
+Linux ARM64 Go executable with Go 1.25, packages two OpenWrt-compatible
+IPKs using outer tar+gzip format, verifies package contents and produces
+SHA256 checksums. No Go toolchain is required on the router.
+
+The frontend is a LuCI JavaScript view with explicit rpcd ACLs.
+It only permits UCI configuration for `frnt-client` and narrowly
+whitelisted service/query helper programs. It does not grant shell
+execution to the web UI.
+
+CI tests are not a substitute for validation on the GL-AXT1800, including
+its vendor LuCI and opkg versions. No deployment has been attempted here.

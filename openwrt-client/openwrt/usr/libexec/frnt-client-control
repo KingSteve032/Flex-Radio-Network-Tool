@@ -1,0 +1,12 @@
+#!/bin/sh
+# LuCI RPC can execute this file but cannot pass arbitrary commands.
+# Only whitelisted OpenWrt init actions are exposed.
+case "$1" in
+  start|stop|restart)
+    exec /etc/init.d/frnt-client "$1"
+    ;;
+  *)
+    echo "Usage: frnt-client-control {start|stop|restart}" >&2
+    exit 2
+    ;;
+esac

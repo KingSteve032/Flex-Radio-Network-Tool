@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -21,7 +22,7 @@ import (
 )
 
 const (
-	version = "0.1.1"
+	version = "0.1.2"
 	serverPort = 14992
 	discoveryPort = 4992
 	helloInterval = 30 * time.Second
@@ -74,8 +75,19 @@ func main() {
 			log.Fatal("-server requires a valid FRNT server VPN IPv4, or use -netbird-routes")
 		}
 	}
-	if err := run(ctx, serverIP, *lanInterface, *vpnInterface); err != nil {
-		log.Fatal(err)
+	// NetBird may start after the FRNT procd service during router boot.
+	// Keep retrying until both VPN and LAN are available rather than dying.
+	for ctx.Err() == nil {
+		if err := run(ctx, serverIP, *lanInterface, *vpnInterface); err != nil {
+			log.Printf("FRNT startup error: %v; retrying in 10s", err)
+		} else {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(10 * time.Second):
+		}
 	}
 }
 
@@ -133,6 +145,7 @@ func run(ctx context.Context, serverIP net.IP, interfaceName, vpnInterface strin
 	cache := make(map[string]cachedFrame)
 	buf := make([]byte, 8192)
 	var frames, heartbeats uint64
+	var lastRefusalLog time.Time
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -164,6 +177,17 @@ func run(ctx context.Context, serverIP net.IP, interfaceName, vpnInterface strin
 			}
 			if ctx.Err() != nil {
 				return nil
+			}
+			if errors.Is(err, syscall.ECONNREFUSED) {
+				// A connected UDP socket reports an ICMP Port Unreachable as
+				// ECONNREFUSED. Usually FRNT is not listening on the VPN
+				// address/UDP 14992 (or a firewall actively rejects it).
+				if time.Since(lastRefusalLog) >= 30*time.Second {
+					log.Printf("FRNT server %s refused UDP 14992: check the server process, SEND_INTERFACE and firewall/NetBird policies", serverAddr.IP)
+					lastRefusalLog = time.Now()
+				}
+				time.Sleep(3 * time.Second)
+				continue
 			}
 			log.Printf("FRNT read error: %v", err)
 			continue

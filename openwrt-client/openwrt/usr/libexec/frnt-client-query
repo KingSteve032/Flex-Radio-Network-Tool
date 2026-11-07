@@ -1,0 +1,32 @@
+#!/bin/sh
+# Read-only LuCI query operations. No caller-provided shell command.
+case "$1" in
+  status)
+    if command -v pidof >/dev/null 2>&1; then
+      ids="$(pidof frnt-openwrt-client 2>/dev/null || true)"
+    else
+      ids=""
+    fi
+    if [ -n "$ids" ]; then
+      printf 'RUNNING (PID %s)\n' "$ids"
+    else
+      echo "STOPPED"
+    fi
+    ;;
+  vpn)
+    ifname="$(uci -q get frnt-client.main.vpn_interface)"
+    [ -n "$ifname" ] || ifname='wt0'
+    case "$ifname" in
+      *[!a-zA-Z0-9_.-]*|'')
+        echo "Invalid VPN interface name"; exit 1 ;;
+    esac
+    ip -4 addr show dev "$ifname" || exit 1
+    ;;
+  logs)
+    logread -l 120 -e 'FRNT' 2>&1
+    ;;
+  *)
+    echo "Usage: frnt-client-query {status|vpn|logs}" >&2
+    exit 2
+    ;;
+esac

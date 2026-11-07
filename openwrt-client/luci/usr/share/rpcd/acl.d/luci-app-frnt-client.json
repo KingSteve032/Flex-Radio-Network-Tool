@@ -1,0 +1,25 @@
+{
+  "luci-app-frnt-client": {
+    "description": "Manage FRNT discovery service and UCI configuration",
+    "read": {
+      "file": {
+        "/usr/libexec/frnt-client-query": [
+          "exec"
+        ]
+      },
+      "uci": [
+        "frnt-client"
+      ]
+    },
+    "write": {
+      "file": {
+        "/usr/libexec/frnt-client-control": [
+          "exec"
+        ]
+      },
+      "uci": [
+        "frnt-client"
+      ]
+    }
+  }
+}
