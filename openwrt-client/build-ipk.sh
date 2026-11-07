@@ -65,7 +65,8 @@ Description: LuCI web controls, NetBird/FRNT status, configuration and logs.
 EOF
 
 make_ipk() {
-  local name="$1" arch="$2" stage="$3" output="$DIST/${name}_${VERSION}_${arch}.ipk"
+  local name="$1" arch="$2" stage="$3"
+  local output="$DIST/${name}_${VERSION}_${arch}.ipk"
   # Force root ownership for package files even when GitHub runner is unprivileged.
   tar --format=gnu --numeric-owner --owner=0 --group=0 -czf "$stage/control.tar.gz" -C "$stage/control" .
   tar --format=gnu --numeric-owner --owner=0 --group=0 -czf "$stage/data.tar.gz" -C "$stage/data" .
