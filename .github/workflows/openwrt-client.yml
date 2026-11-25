@@ -55,8 +55,8 @@ jobs:
         run: |
           set -euo pipefail
           cd openwrt-client/dist
-          base=frnt-openwrt-client_0.1.2_aarch64_cortex-a53_neon-vfpv4.ipk
-          luci=luci-app-frnt-client_0.1.2_all.ipk
+          base=frnt-openwrt-client_0.1.3_aarch64_cortex-a53_neon-vfpv4.ipk
+          luci=luci-app-frnt-client_0.1.3_all.ipk
           for package in "$base" "$luci"; do
             test -s "$package"
             tar -tzf "$package" | grep -Fx './debian-binary'
@@ -73,7 +73,7 @@ jobs:
       - name: Upload Actions artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: frnt-openwrt-client-v0.1.2
+          name: frnt-openwrt-client-v0.1.3
           path: |
             openwrt-client/dist/*.ipk
             openwrt-client/dist/SHA256SUMS.txt
@@ -83,20 +83,22 @@ jobs:
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: openwrt-client-v0.1.2
+          tag_name: openwrt-client-v0.1.3
           target_commitish: ${{ github.sha }}
-          name: FRNT OpenWrt Client v0.1.2 + LuCI
+          name: FRNT OpenWrt Client v0.1.3 — NetBird route recovery
           make_latest: false
           generate_release_notes: false
           body: |
             Updated GL-AXT1800 / OpenWrt 23.05 FRNT discovery client.
 
-            - **Fixed OpenWrt .ipk archive format** (previous v0.1.1 used Debian-style ar packaging)
+            - Follows NetBird policy routing to reach advertised FRNT server network resources (for example 10.2.0.4/32), rather than force-binding a UDP socket to wt0.
+            - Still requires the socket source to be assigned to the configured NetBird interface before any HELLO is transmitted; never silently uses WAN.
+            - Recovers from network/interface loss by reopening the FRNT control socket.
+            - Logs the VPN transport source and first/periodic heartbeats to help test real hardware.
             - **frnt-openwrt-client...ipk**: headless client + procd service
             - **luci-app-frnt-client...ipk**: optional LuCI Services → FRNT Discovery Client controls
-            - Includes NetBird interface check, configuration, Start/Stop/Restart, status, and FRNT logs.
 
-            **Server diagnostics:** `connection refused` to the server's NetBird IP UDP 14992 means the server listener or firewall is rejecting the control traffic. Check that FRNT server mode is running and that `SEND_INTERFACE` is set to the NetBird interface.
+            **Field test:** configure the server to an active NetBird-routed Flextool /32, such as 10.2.0.4, and inspect logs for FRNT heartbeat rx and FRNT discovery rx. This routing change is CI-tested; live GL-AXT1800 behavior still needs verification.
 
             **Discovery-only:** SmartSDR control/TCP and VITA forwarding still require routing or proxy support.
 

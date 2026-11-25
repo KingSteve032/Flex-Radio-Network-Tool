@@ -8,7 +8,6 @@ import (
 	"net"
 	"os/exec"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -86,9 +85,11 @@ func parseNetBirdRoutes(out []byte) (net.IP, error) {
 	return nil, fmt.Errorf("multiple Flextool routes found: choose the FRNT server VPN IP explicitly")
 }
 
-// dialViaVPN ensures that the FRNT control channel cannot silently fall back
-// to the WAN when NetBird is disconnected. Linux SO_BINDTODEVICE pins the
-// socket to the configured VPN interface (normally wt0 on OpenWrt).
+// dialViaVPN follows NetBird's Linux policy routing for network-resource /32
+// routes (10.x), matching the upstream desktop client. SO_BINDTODEVICE can
+// bypass policy routing and cause "network is unreachable" for these routes.
+// Fail closed before sending HELLO if the selected source is not assigned to
+// the NetBird interface; that prevents the control channel leaking to WAN.
 func dialViaVPN(ctx context.Context, serverIP net.IP, vpnInterface string) (*net.UDPConn, error) {
 	if vpnInterface == "" {
 		return nil, fmt.Errorf("VPN interface must be configured (normally wt0)")
@@ -100,22 +101,11 @@ func dialViaVPN(ctx context.Context, serverIP net.IP, vpnInterface string) (*net
 	if iface.Flags&net.FlagUp == 0 {
 		return nil, fmt.Errorf("NetBird interface %q is down", vpnInterface)
 	}
-	dialer := net.Dialer{
-		Timeout: 8 * time.Second,
-		Control: func(_, _ string, raw syscall.RawConn) error {
-			var sockErr error
-			if err := raw.Control(func(fd uintptr) {
-				sockErr = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, vpnInterface)
-			}); err != nil {
-				return err
-			}
-			return sockErr
-		},
-	}
 	addr := net.JoinHostPort(serverIP.String(), fmt.Sprint(serverPort))
-	c, err := dialer.DialContext(ctx, "udp4", addr)
+	// Unmarked sockets must follow the normal NetBird routing policy.
+	c, err := (&net.Dialer{Timeout: 8 * time.Second}).DialContext(ctx, "udp4", addr)
 	if err != nil {
-		return nil, fmt.Errorf("cannot reach FRNT via NetBird interface %q: %w", vpnInterface, err)
+		return nil, fmt.Errorf("cannot route to FRNT %s: %w", addr, err)
 	}
 	conn, ok := c.(*net.UDPConn)
 	if !ok {
@@ -128,12 +118,22 @@ func dialViaVPN(ctx context.Context, serverIP net.IP, vpnInterface string) (*net
 		_ = conn.Close()
 		return nil, err
 	}
-	for _, address := range addrs {
-		ipNet, ok := address.(*net.IPNet)
-		if ok && ipNet.IP.To4() != nil && ipNet.IP.To4().Equal(local) {
-			return conn, nil
+	if !sourceBelongsToVPN(local, addrs) {
+		_ = conn.Close()
+		return nil, fmt.Errorf("route to FRNT %s selected source %s outside NetBird interface %s; no HELLO sent (check ip route get %s)", addr, local, vpnInterface, serverIP)
+	}
+	return conn, nil
+}
+
+func sourceBelongsToVPN(local net.IP, addrs []net.Addr) bool {
+	if local == nil || local.To4() == nil {
+		return false
+	}
+	for _, addr := range addrs {
+		ipNet, ok := addr.(*net.IPNet)
+		if ok && ipNet.IP.To4() != nil && ipNet.IP.To4().Equal(local.To4()) {
+			return true
 		}
 	}
-	_ = conn.Close()
-	return nil, fmt.Errorf("FRNT control channel source %s is not assigned to NetBird interface %s", local, vpnInterface)
+	return false
 }

@@ -5,7 +5,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VERSION="0.1.2"
+VERSION="0.1.3"
 ARCH="aarch64_cortex-a53_neon-vfpv4"
 WORK="$ROOT/dist/package-work"
 DIST="$ROOT/dist"

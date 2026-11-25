@@ -13,13 +13,13 @@ possibly proxy/NAT features. Discovery alone does not provide radio access.
 
 ## Download (GitHub Actions, no Go required on the router)
 
-Public release: https://github.com/KingSteve032/Flex-Radio-Network-Tool/releases/tag/openwrt-client-v0.1.2
+Public release: https://github.com/KingSteve032/Flex-Radio-Network-Tool/releases/tag/openwrt-client-v0.1.3
 
 Two packages are built and independently validated by GitHub Actions:
 
-1. `frnt-openwrt-client_0.1.2_aarch64_cortex-a53_neon-vfpv4.ipk`:
+1. `frnt-openwrt-client_0.1.3_aarch64_cortex-a53_neon-vfpv4.ipk`:
    ARM64 headless client and OpenWrt `procd` service.
-2. `luci-app-frnt-client_0.1.2_all.ipk`:
+2. `luci-app-frnt-client_0.1.3_all.ipk`:
    Optional web interface (LuCI > Services > FRNT Discovery Client).
    Requires LuCI already installed on the GL.iNet router.
    Its dependency on `luci-base` and `rpcd-mod-file` must be satisfied.
@@ -27,7 +27,7 @@ Two packages are built and independently validated by GitHub Actions:
 Also download `SHA256SUMS.txt` to verify the package files.
 
 **The previous v0.1.1 installer was packaged incorrectly as an `ar`
-archive. Version 0.1.2 uses the OpenWrt-standard gzip-compressed tar
+archive. Versions 0.1.2+ use the OpenWrt-standard gzip-compressed tar
 IPK container.** The original failure was not caused by ARM64 support.
 
 Target: GL.iNet GL-AXT1800 / OpenWrt 23.05-SNAPSHOT /
@@ -42,13 +42,13 @@ and copy both to the router's `/tmp` folder (e.g. SCP). On the router:
 
 ```sh
 opkg print-architecture
-opkg install /tmp/frnt-openwrt-client_0.1.2_aarch64_cortex-a53_neon-vfpv4.ipk
+opkg install /tmp/frnt-openwrt-client_0.1.3_aarch64_cortex-a53_neon-vfpv4.ipk
 ```
 
 If LuCI is installed, install the separate frontend as well:
 
 ```sh
-opkg install /tmp/luci-app-frnt-client_0.1.2_all.ipk
+opkg install /tmp/luci-app-frnt-client_0.1.3_all.ipk
 /etc/init.d/rpcd restart
 /etc/init.d/uhttpd restart
 ```
@@ -66,15 +66,20 @@ unauthenticated control endpoint is opened.
 
 ## Configure
 
-Ensure the NetBird peer is already connected and can reach the FRNT
-server VPN IP. For example, in the diagnostic report below,
-the router's NetBird IP is `100.85.12.187` on `wt0`,
-while the example server VPN IP is `100.85.50.97`.
+Ensure NetBird is connected and the selected FRNT service IP can be reached
+through the NetBird routing policy. A selected Flextool /32 network route
+(e.g. `10.2.0.4/32`) is a valid FRNT service destination, even if the
+actual NetBird peer IP is in `100.85.0.0/16`.
 
-Set the **actual** FRNT server's NetBird IP and interfaces:
+For the GL-AXT1800 field test on November 25, 2026:
+- Router NetBird interface `wt0`: `100.85.12.187`.
+- Router LAN `br-lan`: `192.168.9.1/24`, broadcast `192.168.9.255`.
+- Selected Chesapeake PSOC Flextool network: `10.2.0.4/32`.
+
+Set the FRNT service address and interfaces:
 
 ```sh
-uci set frnt-client.main.server='100.85.50.97'
+uci set frnt-client.main.server='10.2.0.4'
 uci set frnt-client.main.netbird_routes='0'
 uci set frnt-client.main.vpn_interface='wt0'
 uci set frnt-client.main.lan_interface='br-lan'
@@ -87,11 +92,14 @@ logread -e FRNT
 To use the UI, edit the same values through LuCI and click **Save & Apply**
 before pressing **Restart**.
 
-NetBird's `wt0` interface is mandatory for the FRNT control channel.
-FRNT uses `SO_BINDTODEVICE` and verifies its source address belongs to
-`wt0`, preventing fallback to the WAN. A missing or not-yet-up
-NetBird interface causes retries every 10 seconds. The client does not
-manage NetBird, its keys, or its routing.
+NetBird must be connected for the FRNT control channel. v0.1.3 uses
+the same Linux policy routing as the working desktop client; it **does not
+force SO_BINDTODEVICE** on routed network resources. Before transmitting
+any HELLO, it checks the chosen UDP socket source IP belongs to the
+configured NetBird interface (`wt0`), failing closed if the WAN would
+be used instead. After a NetBird restart or route outage, it reconnects
+using the current routing policy. The client does not manage NetBird,
+its credentials, or its routing tables.
 
 To stop or restart:
 
@@ -112,7 +120,9 @@ Enable/disable startup on boot after confirming it works:
 Manual VPN server IP is recommended; it works on older OpenWrt builds.
 
 If your NetBird CLI supports `netbird routes list` and there is exactly
-one selected `Flextool` `/32` host route, you can use it instead:
+one selected `Flextool` `/32` host route, you can use it instead. At the
+current W4CAR test network there are **three** matching routes, so specify
+the single server manually until multi-server support is implemented:
 
 ```sh
 netbird routes list
@@ -168,10 +178,24 @@ On the router:
 
 ```sh
 ip -4 addr show dev wt0
-ip route get 100.85.50.97
+ip -4 route get 10.2.0.4
+ip -4 route show table netbird
 netbird status
-logread -e FRNT
+logread -l 100 -e FRNT
 ```
+
+**v0.1.3 field verification:** on a reachable server, look for
+`FRNT heartbeat rx=1` and `FRNT discovery rx=1` log entries.
+A heartbeat confirms server control-channel communication. A discovery
+entry means a validated radio advertisement was sent toward the LAN
+broadcast destination, but verifying reception on a LAN workstation
+still requires a packet capture or SmartSDR discovery test.
+
+The previous `network is unreachable` and `no such device` errors
+to `10.2.0.4` may have resulted from the forced `wt0` binding and/or a
+NetBird interface restart. v0.1.3 addresses the first difference and
+recovers from the latter. A working remote connection still needs
+physical-router verification.
 
 Do not open the FRNT UDP control port to the public Internet.
 

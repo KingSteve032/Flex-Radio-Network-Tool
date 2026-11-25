@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	version = "0.1.2"
+	version = "0.1.3"
 	serverPort = 14992
 	discoveryPort = 4992
 	helloInterval = 30 * time.Second
@@ -126,10 +126,11 @@ func run(ctx context.Context, serverIP net.IP, interfaceName, vpnInterface strin
 		return fmt.Errorf("no source IPv4 route to FRNT server %s", serverAddr)
 	}
 	hello := []byte(fmt.Sprintf("HELLO client_ip=%s client_version=openwrt-%s", transportIP, version))
-	sendHello := func() {
+	sendHello := func() error {
 		if _, err := conn.Write(hello); err != nil {
-			log.Printf("FRNT HELLO send error: %v", err)
+			return fmt.Errorf("FRNT HELLO to %s failed: %w", serverAddr, err)
 		}
+		return nil
 	}
 	sendBroadcast := func(payload []byte) {
 		if _, err := lanPacketConn.WriteTo(payload, lanDest); err != nil {
@@ -137,9 +138,11 @@ func run(ctx context.Context, serverIP net.IP, interfaceName, vpnInterface strin
 		}
 	}
 
-	log.Printf("FRNT client started: server=%s VPN=%s LAN=%s src=%s broadcast=%s:%d",
-		serverAddr, vpnInterface, interfaceName, target.source, target.broadcast, discoveryPort)
-	sendHello()
+	log.Printf("FRNT client started: server=%s vpn_if=%s vpn_src=%s LAN=%s src=%s broadcast=%s:%d routing=netbird-policy",
+		serverAddr, vpnInterface, transportIP, interfaceName, target.source, target.broadcast, discoveryPort)
+	if err := sendHello(); err != nil {
+		return err
+	}
 	nextHello := time.Now().Add(helloInterval)
 	nextRebroadcast := time.Now().Add(rebroadcastInterval)
 	cache := make(map[string]cachedFrame)
@@ -154,7 +157,9 @@ func run(ctx context.Context, serverIP net.IP, interfaceName, vpnInterface strin
 		}
 		now := time.Now()
 		if !now.Before(nextHello) {
-			sendHello()
+			if err := sendHello(); err != nil {
+				return err // reopen the socket after NetBird route/interface changes
+			}
 			nextHello = now.Add(helloInterval)
 		}
 		if !now.Before(nextRebroadcast) {
@@ -178,6 +183,9 @@ func run(ctx context.Context, serverIP net.IP, interfaceName, vpnInterface strin
 			if ctx.Err() != nil {
 				return nil
 			}
+			if isNetworkUnavailable(err) {
+				return fmt.Errorf("FRNT VPN path lost: %w", err)
+			}
 			if errors.Is(err, syscall.ECONNREFUSED) {
 				// A connected UDP socket reports an ICMP Port Unreachable as
 				// ECONNREFUSED. Usually FRNT is not listening on the VPN
@@ -196,6 +204,9 @@ func run(ctx context.Context, serverIP net.IP, interfaceName, vpnInterface strin
 		packet := buf[:n]
 		if bytes.HasPrefix(packet, []byte("HEARTBEAT")) {
 			heartbeats++
+			if heartbeats == 1 || heartbeats%10 == 0 {
+				log.Printf("FRNT heartbeat rx=%d from %s", heartbeats, serverAddr)
+			}
 			continue
 		}
 
@@ -210,6 +221,16 @@ func run(ctx context.Context, serverIP net.IP, interfaceName, vpnInterface strin
 			log.Printf("FRNT discovery rx=%d serial=%s radio=%s -> %s:%d", frames, serial, radioIP, target.broadcast, discoveryPort)
 		}
 	}
+}
+
+// A NetBird restart can invalidate an existing connected UDP socket.
+// Reopen it through current policy routing rather than retrying a dead socket.
+func isNetworkUnavailable(err error) bool {
+	return errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.ENETDOWN) ||
+		errors.Is(err, syscall.ENODEV) ||
+		errors.Is(err, syscall.EADDRNOTAVAIL)
 }
 
 // Validate the VRT frame and discovery metadata before forwarding any bytes

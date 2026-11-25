@@ -31,9 +31,9 @@ return view.extend({
 		s = m.section(form.NamedSection, 'main', 'frnt-client', _('Connection settings'));
 		s.anonymous = true;
 
-		o = s.option(form.Value, 'server', _('FRNT server VPN IPv4'),
-			_('The server NetBird IPv4 address. Leave empty only if automatic NetBird route discovery is enabled.'));
-		o.placeholder = '100.85.50.97';
+		o = s.option(form.Value, 'server', _('FRNT server IPv4 via NetBird'),
+			_('The FRNT service IPv4 address reachable over NetBird. Routed /32 resources such as 10.2.0.4 work; it need not be the server peer VPN IP.'));
+		o.placeholder = '10.2.0.4';
 		o.datatype = 'or(ip4addr,empty)';
 
 		o = s.option(form.Flag, 'netbird_routes', _('Discover server using NetBird routes'),
